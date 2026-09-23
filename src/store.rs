@@ -27,6 +27,9 @@ pub struct Session {
     /// Set when the task works in its own git worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
+    /// Codex's own id for an imported conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

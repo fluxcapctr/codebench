@@ -31,6 +31,8 @@ codebench ~/code/some-project   # add a project and open it
 | `Tab` | In the new task box: give the task its own git worktree |
 | `Ctrl+Shift+H` | Hand off: the agent writes a note, the task continues in a fresh session |
 | `Ctrl+Shift+O` | Add a project folder |
+| `Ctrl+Shift+I` | Import past Claude and Codex chats for this project |
+| `Ctrl+Shift+U` | Accounts: logins per agent, sign in, switch account |
 | `Ctrl+Shift+L` | Link the project's notes to a folder, such as one in your Obsidian vault |
 | `Ctrl+Shift+J` | Open the brief in Obsidian |
 | `Ctrl+Shift+R` | Rename the task |
@@ -103,6 +105,17 @@ codebench schedule off
 Background runs use `claude -p` or `codex exec`, save the answer to
 `notes/runs/`, send a notification, and show up as a task you can open and
 continue.
+
+## Accounts and past chats
+
+The bottom of the sidebar shows which agents are signed in. `Ctrl+Shift+U`
+lists each agent's login (for Claude, the plan and organization), signs in
+with Enter, or switches account with `s` (sign out, then in), in a pane that
+closes when done. `codebench accounts` prints the same from a terminal.
+
+`Ctrl+Shift+I` lists the Claude Code and Codex conversations you had in the
+project's folder outside Codebench; Enter brings one in as a task that
+resumes where it left off.
 
 ## Agents talking to each other
 

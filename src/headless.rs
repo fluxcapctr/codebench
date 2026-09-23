@@ -49,6 +49,7 @@ fn run(pid: &str, wf: &Workflow, now: u64) {
         archived: false,
         workflow: Some(wf.path.clone()),
         worktree: None,
+        codex_id: None,
     };
     let Some(project) = State::load().project(pid).cloned() else { return };
     let Some(argv) = agents::headless_argv(&session, &project, &wf.prompt) else {

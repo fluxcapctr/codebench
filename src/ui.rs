@@ -1,7 +1,9 @@
 //! The window: a project and task sidebar on the left, the selected task's
 //! terminal on the right, a header line above and a key-hint line below.
 
+use crate::accounts::{self, Account, Login};
 use crate::agents;
+use crate::history::{self, Past};
 use crate::bus::{self, Request};
 use crate::git;
 use crate::notes;
@@ -31,6 +33,8 @@ const KEYS: &[(&str, &str)] = &[
     ("Tab", "in the new task box: give the task its own git worktree"),
     ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session"),
     ("Ctrl+Shift+O", "add a project folder"),
+    ("Ctrl+Shift+I", "import past Claude and Codex chats for this project"),
+    ("Ctrl+Shift+U", "accounts: see logins, sign in, switch accounts"),
     ("Ctrl+Shift+L", "link notes to a folder, e.g. in your Obsidian vault"),
     ("Ctrl+Shift+J", "open the brief in Obsidian"),
     ("Ctrl+Shift+R", "rename task"),
@@ -125,7 +129,7 @@ fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<stor
 
 /// Panes that close themselves when their program exits.
 fn transient(key: &str) -> bool {
-    key.starts_with("edit:") || key.starts_with("git:")
+    key.starts_with("edit:") || key.starts_with("git:") || key.starts_with("auth:")
 }
 
 fn notes_key(pid: &str) -> String {
@@ -138,6 +142,8 @@ enum PickerMode {
     Rename(String),
     Help,
     Workflows(String),
+    Accounts,
+    Import(String),
 }
 
 struct Picker {
@@ -152,6 +158,8 @@ struct Picker {
     workflows: RefCell<Vec<Option<Workflow>>>,
     /// NewTask mode: give the task its own worktree (None if not a repo).
     isolate: Cell<Option<bool>>,
+    /// Import mode rows.
+    past: RefCell<Vec<Past>>,
 }
 
 struct Running {
@@ -189,6 +197,8 @@ struct App {
     /// Recent git answers by query, so redraws do not run git every time.
     git_cache: RefCell<HashMap<String, (Instant, Option<String>)>>,
     pending_merge: RefCell<Option<(String, Instant)>>,
+    accounts: RefCell<Vec<Account>>,
+    agents_label: gtk::Label,
     current_project: RefCell<Option<String>>,
     /// Terminal key of the row on screen, if it has one.
     current_key: RefCell<Option<String>>,
@@ -308,6 +318,9 @@ impl App {
         scroller.set_child(Some(&sidebar));
         let subs = label("cb-footer");
         subs.set_wrap(true);
+        subs.set_wrap_mode(pango::WrapMode::WordChar);
+        // Keep the login summary from widening the sidebar.
+        subs.set_max_width_chars(28);
         subs.set_text(&format!(
             "agents: {}",
             agents::installed()
@@ -319,7 +332,7 @@ impl App {
         ));
         sidebar_box.append(&brand);
         sidebar_box.append(&scroller);
-        sidebar_box.append(&subs);
+        sidebar_box.append(&subs.clone());
 
         let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
         main.set_hexpand(true);
@@ -387,6 +400,8 @@ impl App {
             return_to: RefCell::default(),
             git_cache: RefCell::default(),
             pending_merge: RefCell::default(),
+            accounts: RefCell::default(),
+            agents_label: subs,
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -418,6 +433,7 @@ impl App {
             None => bench.show_empty(),
         }
         bench.process_requests();
+        bench.refresh_accounts();
 
         // Scheduled workflows run inside the app while it is open.
         headless::write_pid();
@@ -472,11 +488,11 @@ impl App {
         self.picker.entry.connect_activate(move |_| b.picker_accept());
         let b = self.clone();
         self.picker.entry.connect_changed(move |_| {
-            let pid = match &*b.picker.mode.borrow() {
-                PickerMode::Workflows(pid) => pid.clone(),
-                _ => return,
-            };
-            b.fill_workflows(&pid);
+            match &*b.picker.mode.borrow() {
+                PickerMode::Workflows(pid) => b.fill_workflows(pid),
+                PickerMode::Import(_) => b.fill_import(),
+                _ => {}
+            }
         });
         let b = self.clone();
         self.picker.list.connect_row_activated(move |_, _| b.picker_accept());
@@ -488,6 +504,19 @@ impl App {
             if mods.contains(gdk::ModifierType::CONTROL_MASK) && key.to_lower() == gdk::Key::e {
                 b.edit_picked_workflow();
                 return glib::Propagation::Stop;
+            }
+            if matches!(*b.picker.mode.borrow(), PickerMode::Accounts) {
+                match key.to_lower() {
+                    gdk::Key::s => {
+                        b.sign_in_picked(true);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::r => {
+                        b.refresh_accounts();
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
             }
             if key == gdk::Key::Tab && matches!(*b.picker.mode.borrow(), PickerMode::NewTask) {
                 if let Some(on) = b.picker.isolate.get() {
@@ -767,7 +796,7 @@ impl App {
             }
         }
         self.empty.set_text(&format!(
-            "{}\n{}\n\n{tasks}   ·   {brief}\nnotes in {}{flow_text}\n\n^⇧N  new task      ^⇧P  workflows      ^⇧E  edit notes",
+            "{}\n{}\n\n{tasks}   ·   {brief}\nnotes in {}{flow_text}\n\n^⇧N  new task      ^⇧P  workflows      ^⇧E  edit notes      ^⇧I  import past chats",
             p.name,
             tilde(&p.path),
             tilde(&p.notes_dir()),
@@ -959,6 +988,9 @@ impl App {
                 }
                 b.status.borrow_mut().remove(&id);
                 b.git_cache.borrow_mut().clear();
+                if id.starts_with("auth:") {
+                    b.refresh_accounts();
+                }
                 if b.current_key.borrow().as_deref() == Some(id.as_str()) {
                     b.go_back();
                 }
@@ -1201,6 +1233,7 @@ impl App {
                 archived: false,
                 workflow: None,
                 worktree: old.worktree.clone(),
+                codex_id: None,
             };
             project.sessions.insert(idx + 1, next);
             state.save();
@@ -1210,6 +1243,175 @@ impl App {
         self.select(&Row::Session(new_id));
         self.flash(&format!("handed off. note saved to {}", tilde(&path)));
         true
+    }
+
+    // ── accounts ───────────────────────────────────────────────────────────
+
+    /// Checks every agent's login in the background, then updates the
+    /// sidebar footer and the accounts box if it is open.
+    fn refresh_accounts(self: &Rc<Self>) {
+        let b = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(list) = gio::spawn_blocking(accounts::check_all).await else { return };
+            *b.accounts.borrow_mut() = list;
+            b.show_accounts_summary();
+            if matches!(*b.picker.mode.borrow(), PickerMode::Accounts) {
+                b.fill_accounts();
+            }
+        });
+    }
+
+    fn show_accounts_summary(&self) {
+        let theme = self.theme.borrow();
+        let parts: Vec<String> = self
+            .accounts
+            .borrow()
+            .iter()
+            .map(|a| match a.login {
+                Login::In(_) => format!("{} <span foreground='{}'>✓</span>", a.agent, theme.green),
+                Login::Out => format!("{} <span foreground='{}'>✗</span>", a.agent, theme.red),
+                Login::Unknown(_) => format!("{} ?", a.agent),
+            })
+            .collect();
+        self.agents_label.set_markup(&format!("{}   ^⇧U", parts.join("  ")));
+    }
+
+    fn open_accounts(self: &Rc<Self>) {
+        self.picker.fill("accounts   enter sign in · s switch account · r refresh · esc close", None, &["checking…".to_string()]);
+        *self.picker.mode.borrow_mut() = PickerMode::Accounts;
+        self.fill_accounts();
+        self.picker.show();
+        self.refresh_accounts();
+    }
+
+    fn fill_accounts(&self) {
+        let rows: Vec<String> = self
+            .accounts
+            .borrow()
+            .iter()
+            .map(|a| match &a.login {
+                Login::In(detail) => format!("{:<10}✓ {detail}", a.agent),
+                Login::Out => format!("{:<10}✗ signed out", a.agent),
+                Login::Unknown(why) => format!("{:<10}? {why}", a.agent),
+            })
+            .collect();
+        if !rows.is_empty() {
+            let selected = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0);
+            self.picker.set_options(&rows);
+            if let Some(row) = self.picker.list.row_at_index(selected) {
+                self.picker.list.select_row(Some(&row));
+                row.grab_focus();
+            }
+        }
+    }
+
+    /// Runs the picked agent's sign-in (or sign-out and sign-in) in a pane.
+    fn sign_in_picked(self: &Rc<Self>, switch: bool) {
+        let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+        let Some(agent) = self.accounts.borrow().get(idx).map(|a| a.agent) else { return };
+        let Some(cmd) = accounts::login_command(agent, switch) else { return };
+        *self.picker.mode.borrow_mut() = PickerMode::Closed;
+        self.picker.root.set_visible(false);
+        let key = format!("auth:{agent}");
+        *self.return_to.borrow_mut() = self.selected_row();
+        *self.current_key.borrow_mut() = Some(key.clone());
+        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+        self.spawn(&key, "auth", &argv, &store::home(), &[]);
+        self.focus_terminal(&key);
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>{agent}</b></span>  {}",
+            self.theme.borrow().accent,
+            if switch { "switch account" } else { "sign in" }
+        ));
+        self.header_right.set_text("returns when done");
+    }
+
+    // ── import ─────────────────────────────────────────────────────────────
+
+    fn open_import(self: &Rc<Self>) {
+        let Some(pid) = self.current_project.borrow().clone() else {
+            self.flash("select a project first");
+            return;
+        };
+        let Some(project) = self.state.borrow().project(&pid).cloned() else { return };
+        self.picker.fill(
+            &format!("import past chats into {}   enter import · esc close", project.name),
+            Some(("filter", "")),
+            &["looking…".to_string()],
+        );
+        self.picker.past.borrow_mut().clear();
+        *self.picker.mode.borrow_mut() = PickerMode::Import(pid);
+        self.picker.show();
+
+        let known: Vec<String> = project
+            .sessions
+            .iter()
+            .flat_map(|s| [Some(s.id.clone()), s.codex_id.clone()])
+            .flatten()
+            .collect();
+        let path = project.path.clone();
+        let b = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(found) = gio::spawn_blocking(move || history::find(&path, &known)).await else { return };
+            *b.picker.past.borrow_mut() = found;
+            if matches!(*b.picker.mode.borrow(), PickerMode::Import(_)) {
+                b.fill_import();
+            }
+        });
+    }
+
+    /// The import rows matching the filter, in the order they are shown.
+    fn import_rows(&self) -> Vec<Past> {
+        let filter = self.picker.entry.text().trim().to_lowercase();
+        self.picker
+            .past
+            .borrow()
+            .iter()
+            .filter(|p| filter.is_empty() || p.title.to_lowercase().contains(&filter))
+            .cloned()
+            .collect()
+    }
+
+    fn fill_import(&self) {
+        let rows: Vec<String> = self
+            .import_rows()
+            .iter()
+            .map(|p| format!("{:<8}{}  {}", p.agent, workflow::stamp(p.updated), p.title))
+            .collect();
+        if rows.is_empty() {
+            self.picker.set_options(&["no past chats found for this folder".to_string()]);
+        } else {
+            self.picker.set_options(&rows);
+        }
+    }
+
+    fn import_picked(self: &Rc<Self>, pid: &str) {
+        let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+        let Some(past) = self.import_rows().get(idx).cloned() else { return };
+        let session = Session {
+            id: if past.agent == "claude" { past.id.clone() } else { uuid::Uuid::new_v4().to_string() },
+            agent: past.agent.to_string(),
+            title: past.title.clone(),
+            created: past.updated,
+            launched: true,
+            prompt: None,
+            archived: false,
+            workflow: None,
+            worktree: None,
+            codex_id: (past.agent == "codex").then(|| past.id.clone()),
+        };
+        let sid = session.id.clone();
+        {
+            let mut state = self.state.borrow_mut();
+            let Some(project) = state.project_mut(pid) else { return };
+            project.sessions.push(session);
+            state.save();
+        }
+        self.picker.past.borrow_mut().retain(|p| p.id != past.id);
+        self.refresh_context(&sid);
+        self.rebuild_sidebar();
+        self.fill_import();
+        self.flash(&format!("imported \"{}\". pick more, or esc", past.title));
     }
 
     // ── git ────────────────────────────────────────────────────────────────
@@ -1456,6 +1658,7 @@ impl App {
                 archived: false,
                 workflow: Some(wf.path.clone()),
                 worktree: None,
+                codex_id: None,
             },
         );
         if focus {
@@ -1553,6 +1756,7 @@ impl App {
                 archived: false,
                 workflow: None,
                 worktree: None,
+                codex_id: None,
             });
             state.save();
         }
@@ -1594,6 +1798,8 @@ impl App {
                 gdk::Key::e => self.open_notes(),
                 gdk::Key::h => self.start_handoff(),
                 gdk::Key::o => self.add_project_dialog(),
+                gdk::Key::u => self.open_accounts(),
+                gdk::Key::i => self.open_import(),
                 gdk::Key::l => self.link_notes_dialog(),
                 gdk::Key::j => self.open_in_obsidian(),
                 gdk::Key::r => self.open_rename(),
@@ -1851,6 +2057,14 @@ impl App {
         match mode {
             PickerMode::Closed => {}
             PickerMode::Help => self.close_picker(),
+            PickerMode::Accounts => {
+                *self.picker.mode.borrow_mut() = PickerMode::Accounts;
+                self.sign_in_picked(false);
+            }
+            PickerMode::Import(pid) => {
+                *self.picker.mode.borrow_mut() = PickerMode::Import(pid.clone());
+                self.import_picked(&pid);
+            }
             PickerMode::Workflows(pid) => {
                 let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
                 let picked = self.picker.workflows.borrow().get(idx).cloned();
@@ -1913,6 +2127,7 @@ impl App {
                         archived: false,
                         workflow: None,
                         worktree,
+                        codex_id: None,
                     });
                     state.save();
                 }
@@ -1948,6 +2163,7 @@ impl Picker {
             items: RefCell::default(),
             workflows: RefCell::default(),
             isolate: Cell::new(None),
+            past: RefCell::default(),
         }
     }
 

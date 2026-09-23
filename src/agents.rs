@@ -177,6 +177,9 @@ fn codex_marker(task: &str) -> String {
 /// looking only at session files written since the task was created.
 fn codex_session(session: &Session) -> Option<String> {
     use std::io::Read;
+    if let Some(id) = &session.codex_id {
+        return Some(id.clone());
+    }
     let root = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".codex"))

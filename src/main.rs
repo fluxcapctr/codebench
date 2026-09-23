@@ -1,7 +1,9 @@
+mod accounts;
 mod agents;
 mod bus;
 mod git;
 mod headless;
+mod history;
 mod mcp;
 mod notes;
 mod store;
@@ -42,6 +44,16 @@ fn main() -> gtk::glib::ExitCode {
     match args.get(1).map(String::as_str) {
         Some("run-due") => {
             headless::run_due();
+            std::process::exit(0);
+        }
+        Some("accounts") => {
+            for a in accounts::check_all() {
+                match a.login {
+                    accounts::Login::In(d) => println!("{:<10}signed in  {d}", a.agent),
+                    accounts::Login::Out => println!("{:<10}signed out", a.agent),
+                    accounts::Login::Unknown(w) => println!("{:<10}unknown    {w}", a.agent),
+                }
+            }
             std::process::exit(0);
         }
         Some("schedule") => std::process::exit(headless::schedule(args.get(2).map(String::as_str))),
