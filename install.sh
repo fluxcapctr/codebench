@@ -7,3 +7,11 @@ cargo build --release
 install -Dm755 target/release/codebench "$HOME/.local/bin/codebench"
 install -Dm644 codebench.desktop "$HOME/.local/share/applications/codebench.desktop"
 echo "installed: codebench"
+
+# The Omarchy bar widget: link it in once; add it to the bar yourself with
+#   omarchy bar put io.github.fluxcapctr.codebench
+plugins="$HOME/.config/omarchy/plugins"
+if [ -d "$plugins" ] && [ ! -e "$plugins/io.github.fluxcapctr.codebench" ]; then
+  ln -s "$PWD/plugin" "$plugins/io.github.fluxcapctr.codebench"
+  echo "linked the bar widget. add it with: omarchy bar put io.github.fluxcapctr.codebench"
+fi

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.fluxcapctr.codebench",
+  "name": "Codebench",
+  "version": "0.1.0",
+  "author": "Eric Stevens",
+  "license": "MIT",
+  "description": "Shows which Codebench agent tasks need you or are working, and jumps to them.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Codebench",
+    "description": "A count of agent tasks that need you; click for the list and jump to one.",
+    "category": "Development",
+    "aliases": ["codebench", "agents", "claude", "codex"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}

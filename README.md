@@ -117,6 +117,20 @@ Background runs use `claude -p` or `codex exec`, save the answer to
 `notes/runs/`, send a notification, and show up as a task you can open and
 continue.
 
+## In the Omarchy bar
+
+`plugin/` is an Omarchy shell bar widget: a `>_` that shows how many tasks
+need you (or how many are working), with a dropdown listing them; click one
+to jump straight to it. `install.sh` links it into
+`~/.config/omarchy/plugins`; add it to the bar with
+`omarchy bar put io.github.fluxcapctr.codebench`. It reads
+`codebench status --follow`, and `codebench --task <id>` opens a task.
+
+While any agent is working, Codebench holds a `systemd-inhibit` sleep lock
+so the machine does not suspend mid-task. The screen still locks as usual.
+
+Drop files onto a task to type their paths into it.
+
 ## Accounts and past chats
 
 The bottom of the sidebar shows which agents are signed in. `Ctrl+Shift+U`

@@ -207,6 +207,8 @@ struct App {
     side_holder: gtk::Box,
     /// The task shown on the right of a split.
     pinned: RefCell<Option<String>>,
+    /// Holds off suspend while any agent is working.
+    keep_awake: RefCell<Option<std::process::Child>>,
     current_project: RefCell<Option<String>>,
     /// Terminal key of the row on screen, if it has one.
     current_key: RefCell<Option<String>>,
@@ -228,7 +230,13 @@ pub fn run() -> glib::ExitCode {
         });
         // `codebench <dir>` adds the folder as a project and opens it, also
         // when Codebench is already running.
-        if let Some(arg) = cmd.arguments().get(1) {
+        let args = cmd.arguments();
+        if args.get(1).is_some_and(|a| a == "--task") {
+            // `codebench --task <id>`: jump to a task (used by the bar widget).
+            if let Some(sid) = args.get(2).map(|a| a.to_string_lossy().into_owned()) {
+                b.select(&Row::Session(sid));
+            }
+        } else if let Some(arg) = args.get(1) {
             let path = PathBuf::from(arg);
             let path = match cmd.cwd() {
                 Some(cwd) if path.is_relative() => cwd.join(path),
@@ -433,6 +441,7 @@ impl App {
             side_header,
             side_holder,
             pinned: RefCell::default(),
+            keep_awake: RefCell::default(),
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -1061,6 +1070,26 @@ impl App {
         term.set_mouse_autohide(true);
         term.set_allow_hyperlink(true);
         term.set_scroll_on_keystroke(true);
+
+        // Dropping files types their paths in, quoted, like a terminal does.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let t = term.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            let Ok(list) = value.get::<gdk::FileList>() else { return false };
+            let paths: Vec<String> = list
+                .files()
+                .iter()
+                .filter_map(|f| f.path())
+                .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''")))
+                .collect();
+            if paths.is_empty() {
+                return false;
+            }
+            t.paste_text(&format!("{} ", paths.join(" ")));
+            t.grab_focus();
+            true
+        });
+        term.add_controller(drop);
         self.style_terminal(&term);
 
         let b = self.clone();
@@ -1232,6 +1261,40 @@ impl App {
         self.rebuild_sidebar();
         if self.current_key.borrow().as_deref() == Some(key) {
             self.update_header();
+        }
+        self.update_keep_awake();
+    }
+
+    /// While any agent is working, a systemd-inhibit lock stops the machine
+    /// from suspending. The screen can still lock. The lock ends with the
+    /// app, since it waits on our process id.
+    fn update_keep_awake(&self) {
+        let working = self.status.borrow().values().any(|s| *s == Status::Working);
+        let mut lock = self.keep_awake.borrow_mut();
+        match (working, lock.is_some()) {
+            (true, false) => {
+                *lock = std::process::Command::new("systemd-inhibit")
+                    .args([
+                        "--what=sleep",
+                        "--who=Codebench",
+                        "--why=Agents are working",
+                        "--mode=block",
+                        "tail",
+                        &format!("--pid={}", std::process::id()),
+                        "-f",
+                        "/dev/null",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .ok();
+            }
+            (false, true) => {
+                if let Some(mut child) = lock.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            _ => {}
         }
     }
 

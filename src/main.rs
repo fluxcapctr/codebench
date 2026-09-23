@@ -48,6 +48,10 @@ fn main() -> gtk::glib::ExitCode {
             headless::run_due();
             std::process::exit(0);
         }
+        Some("status") => {
+            headless::status(args.iter().any(|a| a == "--follow"));
+            std::process::exit(0);
+        }
         Some("accounts") => {
             for a in accounts::check_all() {
                 match a.login {

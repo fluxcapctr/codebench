@@ -17,7 +17,7 @@ pub fn write_pid() {
     let _ = std::fs::write(pid_file(), std::process::id().to_string());
 }
 
-fn app_running() -> bool {
+pub fn app_running() -> bool {
     let Some(pid) = std::fs::read_to_string(pid_file()).ok().and_then(|s| s.trim().parse::<u32>().ok()) else {
         return false;
     };
@@ -139,4 +139,57 @@ pub fn schedule(arg: Option<&str>) -> i32 {
             0
         }
     }
+}
+
+/// `codebench status [--follow]`: a JSON line for the bar widget with the
+/// tasks that are working or need you. With --follow, a new line each time
+/// it changes.
+pub fn status(follow: bool) {
+    let mut last = String::new();
+    loop {
+        let line = status_line();
+        if line != last {
+            println!("{line}");
+            use std::io::Write;
+            if std::io::stdout().flush().is_err() {
+                return;
+            }
+            last = line;
+        }
+        if !follow {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn status_line() -> String {
+    if !app_running() {
+        return serde_json::json!({ "running": false, "needs": 0, "working": 0, "tasks": [] }).to_string();
+    }
+    let live = crate::bus::read_snapshot();
+    let state = State::load();
+    let mut tasks = Vec::new();
+    let (mut needs, mut working) = (0, 0);
+    for p in &state.projects {
+        for s in p.sessions.iter().filter(|s| !s.archived) {
+            let Some(status) = live.get(&s.id) else { continue };
+            let kind = match status.as_str() {
+                "waiting on the user" | "done" => {
+                    needs += 1;
+                    "needs"
+                }
+                "working" => {
+                    working += 1;
+                    "working"
+                }
+                _ => continue,
+            };
+            tasks.push(serde_json::json!({
+                "id": s.id, "project": p.name, "title": s.title, "agent": s.agent,
+                "status": status, "kind": kind,
+            }));
+        }
+    }
+    serde_json::json!({ "running": true, "needs": needs, "working": working, "tasks": tasks }).to_string()
 }
