@@ -175,6 +175,27 @@ fn codex_marker(task: &str) -> String {
 
 /// Finds this task's Codex conversation by the marker in its instructions,
 /// looking only at session files written since the task was created.
+/// The rollout file of this task's Codex conversation.
+pub fn codex_rollout(session: &Session) -> Option<PathBuf> {
+    let id = codex_session(session)?;
+    let root = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".codex"))
+        .join("sessions");
+    let mut dirs = vec![root];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&format!("{id}.jsonl"))) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn codex_session(session: &Session) -> Option<String> {
     use std::io::Read;
     if let Some(id) = &session.codex_id {

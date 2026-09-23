@@ -6,6 +6,7 @@ mod headless;
 mod history;
 mod mcp;
 mod notes;
+mod progress;
 mod store;
 mod theme;
 mod ui;

@@ -9,6 +9,7 @@ use crate::git;
 use crate::notes;
 use crate::store::{self, Session, State};
 use crate::theme::{self, Theme};
+use crate::progress;
 use crate::usage;
 use crate::workflow::{self, Workflow};
 use crate::headless;
@@ -207,6 +208,7 @@ struct App {
     side_holder: gtk::Box,
     /// The task shown on the right of a split.
     pinned: RefCell<Option<String>>,
+    board: gtk::Label,
     /// Holds off suspend while any agent is working.
     keep_awake: RefCell<Option<std::process::Child>>,
     current_project: RefCell<Option<String>>,
@@ -371,6 +373,19 @@ impl App {
         empty.set_justify(gtk::Justification::Center);
         stack.add_named(&empty, Some("empty"));
 
+        // The project page: a left-aligned board that scrolls.
+        let board = gtk::Label::new(None);
+        board.set_xalign(0.0);
+        board.set_yalign(0.0);
+        board.set_wrap(true);
+        board.set_wrap_mode(pango::WrapMode::WordChar);
+        board.set_selectable(false);
+        board.add_css_class("cb-board");
+        let board_scroll = gtk::ScrolledWindow::new();
+        board_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        board_scroll.set_child(Some(&board));
+        stack.add_named(&board_scroll, Some("project"));
+
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
 
@@ -442,6 +457,7 @@ impl App {
             side_holder,
             pinned: RefCell::default(),
             keep_awake: RefCell::default(),
+            board,
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -816,41 +832,113 @@ impl App {
         self.update_header();
     }
 
-    fn show_project(&self, pid: &str) {
+    /// The project page: a progress board of its tasks (status, plan and
+    /// latest message), then its workflows and keys. Plans are read from
+    /// transcripts in the background and filled in when ready.
+    fn show_project(self: &Rc<Self>, pid: &str) {
         let Some(p) = self.state.borrow().project(pid).cloned() else { return };
         *self.current_project.borrow_mut() = Some(pid.to_string());
         *self.current_key.borrow_mut() = None;
-        let live = p.sessions.iter().filter(|s| !s.archived).count();
-        let tasks = match live {
-            0 => "no tasks yet".to_string(),
-            1 => "1 task".to_string(),
-            n => format!("{n} tasks"),
-        };
-        let brief = if notes::brief(&p).is_some() { "brief written" } else { "no brief yet" };
-        let flows = workflow::list(&p);
-        let mut flow_text = String::new();
+        self.board.set_markup(&self.board_markup(&p, &HashMap::new()));
+        self.stack.set_visible_child_name("project");
+        self.update_header();
+
+        let live: Vec<Session> = p.sessions.iter().filter(|s| !s.archived).cloned().collect();
+        let b = self.clone();
+        let pid = pid.to_string();
+        glib::spawn_future_local(async move {
+            let Ok(found) = gio::spawn_blocking(move || {
+                live.iter()
+                    .filter_map(|s| {
+                        let progress = match s.agent.as_str() {
+                            "claude" => progress::claude(&agents::claude_transcript(&s.id)?),
+                            "codex" => progress::codex(&agents::codex_rollout(s)?),
+                            _ => return None,
+                        };
+                        Some((s.id.clone(), progress))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .await
+            else {
+                return;
+            };
+            // Only if the page is still showing this project.
+            let showing = b.current_key.borrow().is_none() && b.current_project.borrow().as_deref() == Some(pid.as_str());
+            let project = b.state.borrow().project(&pid).cloned();
+            if let (true, Some(project)) = (showing, project) {
+                b.board.set_markup(&b.board_markup(&project, &found));
+            }
+        });
+    }
+
+    fn board_markup(&self, p: &store::Project, progress: &HashMap<String, progress::Progress>) -> String {
+        let t = self.theme.borrow();
+        let dim = |s: &str| format!("<span foreground='{}'>{}</span>", t.muted, esc(s));
+        let mut out = format!("<span foreground='{}' size='large'><b>{}</b></span>   {}\n", t.accent, esc(&p.name), dim(&tilde(&p.path)));
+        let brief = if notes::brief(p).is_some() { "brief written" } else { "no brief yet (^⇧E)" };
+        out.push_str(&format!("{}\n\n", dim(&format!("{brief}   ·   notes in {}", tilde(&p.notes_dir())))));
+
+        let live: Vec<&Session> = p.sessions.iter().filter(|s| !s.archived).collect();
+        if live.is_empty() {
+            out.push_str(&dim("no tasks yet. ^⇧N starts one, ^⇧I imports past chats"));
+            out.push_str("\n");
+        }
+        for s in live {
+            let status = self.status_of(&s.id);
+            let (glyph, color, word) = status.look(&t);
+            let context = self.context.borrow().get(&s.id).map(|&n| format!("  {}", usage::short(n))).unwrap_or_default();
+            out.push_str(&format!(
+                "<span foreground='{color}'>{glyph}</span> {} <b>{}</b>  <span foreground='{color}'>{word}</span>{}\n",
+                dim(&format!("{:<8}", s.agent)),
+                esc(&s.title),
+                dim(&context)
+            ));
+            if let Some(pr) = progress.get(&s.id) {
+                const SHOWN: usize = 8;
+                let done = pr.steps.iter().filter(|x| x.state == progress::StepState::Done).count();
+                if !pr.steps.is_empty() {
+                    out.push_str(&format!("   {}\n", dim(&format!("plan {done}/{}", pr.steps.len()))));
+                }
+                // Keep the unfinished steps in view when the plan is long.
+                let skip = pr.steps.len().saturating_sub(SHOWN).min(done);
+                for step in pr.steps.iter().skip(skip).take(SHOWN) {
+                    let (mark, c) = match step.state {
+                        progress::StepState::Done => ("✓", &t.green),
+                        progress::StepState::Active => ("◐", &t.yellow),
+                        progress::StepState::Pending => ("○", &t.muted),
+                    };
+                    out.push_str(&format!("   <span foreground='{c}'>{mark}</span> {}\n", esc(&step.text)));
+                }
+                if let Some(last) = &pr.last {
+                    let line = last.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                    let line: String = if line.chars().count() > 140 { line.chars().take(139).chain(['…']).collect() } else { line.to_string() };
+                    out.push_str(&format!("   {} {}\n", dim("›"), dim(&line)));
+                }
+            }
+            out.push('\n');
+        }
+
+        let flows = workflow::list(p);
         if !flows.is_empty() {
-            flow_text.push_str("\n\nworkflows\n");
+            out.push_str(&format!("<b>workflows</b>  {}\n", dim("^⇧P")));
             for wf in &flows {
                 let when = match (&wf.schedule, &wf.schedule_text) {
                     (Some(_), Some(text)) => format!("  ·  {text}"),
                     (None, Some(text)) => format!("  ·  can't read schedule \"{text}\""),
                     _ => String::new(),
                 };
-                flow_text.push_str(&format!("{}{when}\n", wf.name));
+                let scope = if wf.global { "  (global)" } else { "" };
+                out.push_str(&format!("  {}{}\n", esc(&wf.name), dim(&format!("{when}{scope}"))));
             }
             if flows.iter().any(|w| w.schedule.is_some() && !w.global) && !headless::timer_installed() {
-                flow_text.push_str("\nscheduled runs happen while codebench is open.\nrun  codebench schedule on  to also run them while it is closed\n");
+                out.push_str(&dim("  scheduled runs happen while codebench is open; codebench schedule on also runs them while it is closed"));
+                out.push('\n');
             }
+            out.push('\n');
         }
-        self.empty.set_text(&format!(
-            "{}\n{}\n\n{tasks}   ·   {brief}\nnotes in {}{flow_text}\n\n^⇧N  new task      ^⇧P  workflows      ^⇧E  edit notes      ^⇧I  import past chats",
-            p.name,
-            tilde(&p.path),
-            tilde(&p.notes_dir()),
-        ));
-        self.stack.set_visible_child_name("empty");
-        self.update_header();
+        out.push_str(&dim("^⇧N new task   ^⇧P workflows   ^⇧E notes   ^⇧I import past chats   ^⇧G git   F1 all keys"));
+        out
     }
 
     /// Shows the terminal for `key`, starting it with `start` if it is not
@@ -869,7 +957,7 @@ impl App {
         self.stack.set_visible_child_name("empty");
         let b = self.clone();
         let key = key.to_string();
-        glib::timeout_add_local_once(Duration::from_millis(300), move || {
+        glib::timeout_add_local_once(Duration::from_millis(500), move || {
             if b.current_key.borrow().as_deref() != Some(&key) {
                 return;
             }

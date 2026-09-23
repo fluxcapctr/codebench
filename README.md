@@ -55,6 +55,13 @@ codebench ~/code/some-project   # add a project and open it
 | `Alt+Up/Down` | Move through projects, notes and tasks |
 | `F1` | All keys |
 
+## Project board
+
+Selecting a project shows its board: every task with its status and context
+size, its current plan as a checklist (from Claude Code's task list or
+Codex's plan), and the latest thing the agent said. Below that are the
+project's workflows.
+
 ## Keeping context small
 
 Each task is its own conversation. Instead of one long chat per project:

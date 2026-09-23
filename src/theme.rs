@@ -168,6 +168,7 @@ list > row:selected label {{ color: {fg}; }}
 .cb-footer.cb-flash {{ color: {accent}; }}
 vte-terminal {{ padding: 6px 10px; }}
 .cb-empty {{ color: {muted}; }}
+.cb-board {{ padding: 18px 24px; color: {fg}; }}
 .cb-split {{ border-left: 1px solid {muted}; }}
 paned > separator {{ background: {muted}; min-width: 1px; }}
 .cb-picker {{ background: {dark}; border: 1px solid {accent}; padding: 10px; }}
