@@ -1,4 +1,6 @@
 mod agents;
+mod bus;
+mod mcp;
 mod notes;
 mod store;
 mod theme;
@@ -22,6 +24,19 @@ const PARENT_SESSION_VARS: &[&str] = &[
 ];
 
 fn main() -> gtk::glib::ExitCode {
+    // `codebench mcp --session <id>`: the per-task MCP server agents launch.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("mcp") {
+        let session = args
+            .iter()
+            .position(|a| a == "--session")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default();
+        mcp::serve(session);
+        std::process::exit(0);
+    }
+
     for var in PARENT_SESSION_VARS {
         // SAFETY: runs before GTK or any other thread starts.
         unsafe { std::env::remove_var(var) };

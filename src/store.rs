@@ -51,7 +51,14 @@ pub struct State {
     pub projects: Vec<Project>,
 }
 
+/// Agents can hand MCP servers a trimmed environment, so `codebench mcp`
+/// receives Codebench's folders explicitly through these variables.
+pub const DIR_VARS: [&str; 3] = ["CODEBENCH_CONFIG_DIR", "CODEBENCH_CACHE_DIR", "CODEBENCH_DATA_DIR"];
+
 pub fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DIR_VARS[0]) {
+        return dir.into();
+    }
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
@@ -59,6 +66,9 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn cache_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DIR_VARS[1]) {
+        return dir.into();
+    }
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".cache"))
@@ -66,6 +76,9 @@ pub fn cache_dir() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DIR_VARS[2]) {
+        return dir.into();
+    }
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/share"))

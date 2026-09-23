@@ -2,6 +2,7 @@
 //! terminal on the right, a header line above and a key-hint line below.
 
 use crate::agents;
+use crate::bus::{self, Request};
 use crate::notes;
 use crate::store::{self, Session, State};
 use crate::theme::{self, Theme};
@@ -79,6 +80,22 @@ impl Status {
     fn running(self) -> bool {
         !matches!(self, Status::Dormant | Status::Exited)
     }
+
+    /// Whether the agent can take a new message right now.
+    fn free(self) -> bool {
+        matches!(self, Status::Idle | Status::Done)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Status::Dormant => "not running",
+            Status::Idle => "idle",
+            Status::Working => "working",
+            Status::Waiting => "waiting on the user",
+            Status::Done => "done",
+            Status::Exited => "stopped",
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -137,6 +154,8 @@ struct App {
     context: RefCell<HashMap<String, u64>>,
     /// Sessions asked to write a handoff note, and where.
     handoffs: RefCell<HashMap<String, PathBuf>>,
+    /// Messages from other tasks waiting for the agent to be free.
+    inbox: RefCell<HashMap<String, Vec<String>>>,
     current_project: RefCell<Option<String>>,
     /// Terminal key of the row on screen, if it has one.
     current_key: RefCell<Option<String>>,
@@ -194,6 +213,14 @@ fn tilde(path: &Path) -> String {
     let path = path.display().to_string();
     let home = store::home().display().to_string();
     path.strip_prefix(&home).map(|r| format!("~{r}")).unwrap_or(path)
+}
+
+/// Types text into an agent's prompt as a paste, then presses Enter
+/// separately so the newline is not taken as part of the paste.
+fn type_into(term: &vte::Terminal, text: &str) {
+    term.paste_text(text);
+    let term = term.clone();
+    glib::timeout_add_local_once(Duration::from_millis(250), move || term.feed_child(b"\r"));
 }
 
 fn label(class: &str) -> gtk::Label {
@@ -323,6 +350,7 @@ impl App {
             status: RefCell::default(),
             context: RefCell::default(),
             handoffs: RefCell::default(),
+            inbox: RefCell::default(),
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -353,6 +381,7 @@ impl App {
             Some(pid) => bench.select(&Row::Project(pid)),
             None => bench.show_empty(),
         }
+        bench.process_requests();
         bench
     }
 
@@ -438,6 +467,19 @@ impl App {
                 let sid = name.to_string_lossy().into_owned();
                 if let Some(status) = std::fs::read_to_string(path).ok().as_deref().and_then(Status::parse) {
                     b.set_status(&sid, status);
+                }
+            });
+            monitors.push(m);
+        }
+
+        let requests = bus::dir();
+        let _ = std::fs::create_dir_all(&requests);
+        if let Ok(m) = gio::File::for_path(&requests).monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>) {
+            let b = self.clone();
+            m.connect_changed(move |_, file, _, event| {
+                let is_request = file.path().is_some_and(|p| p.extension().is_some_and(|e| e == "json"));
+                if is_request && event == gio::FileMonitorEvent::Created {
+                    b.process_requests();
                 }
             });
             monitors.push(m);
@@ -535,6 +577,12 @@ impl App {
                         format!("  <span foreground='{c}'>{}</span>", usage::short(n))
                     })
                     .unwrap_or_default();
+                let waiting_mail = self.inbox.borrow().get(&s.id).map_or(0, Vec::len);
+                let tokens = if waiting_mail > 0 {
+                    format!("{tokens}  <span foreground='{}'>✉{waiting_mail}</span>", theme.accent)
+                } else {
+                    tokens
+                };
                 let title = if s.archived {
                     format!("<span foreground='{}'>{} ↳</span>", theme.muted, esc(&s.title))
                 } else {
@@ -548,6 +596,13 @@ impl App {
                 rows.push(Row::Session(s.id.clone()));
             }
         }
+        let snapshot = state
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .map(|s| (s.id.clone(), self.status_of(&s.id).name()))
+            .collect();
+        bus::write_snapshot(&snapshot);
         drop((state, theme, context));
 
         let idx = self.selected_row().and_then(|sel| rows.iter().position(|r| *r == sel));
@@ -646,7 +701,7 @@ impl App {
         *self.current_project.borrow_mut() = Some(pid);
         *self.current_key.borrow_mut() = Some(sid.to_string());
         let id = sid.to_string();
-        self.show_terminal(sid, move |b| b.launch(&id));
+        self.show_terminal(sid, move |b| b.launch(&id, None));
     }
 
     /// The project's notes folder, opened in your editor in a terminal pane.
@@ -833,8 +888,9 @@ impl App {
         self.rebuild_sidebar();
     }
 
-    /// Starts the task's agent, resuming its previous conversation if it has one.
-    fn launch(self: &Rc<Self>, sid: &str) {
+    /// Starts the task's agent, resuming its previous conversation if it has
+    /// one. `prompt` is sent as the opening message where the agent allows.
+    fn launch(self: &Rc<Self>, sid: &str, prompt: Option<&str>) {
         let Some((project, session)) = self
             .state
             .borrow()
@@ -853,7 +909,7 @@ impl App {
             format!("CODEBENCH_PROJECT={}", project.path.display()),
             format!("CODEBENCH_NOTES={}", project.notes_dir().display()),
         ];
-        let argv = agents::argv(&session, &project);
+        let argv = agents::argv(&session, &project, prompt);
         self.spawn(sid, &session.agent, &argv, &project.path, &env);
 
         if let Some(s) = self.state.borrow_mut().session_mut(sid) {
@@ -892,6 +948,9 @@ impl App {
         }
         if status.wants_attention() && !visible {
             self.notify(key, status);
+        }
+        if status.free() {
+            self.deliver_inbox(key);
         }
         self.rebuild_sidebar();
     }
@@ -952,10 +1011,7 @@ impl App {
         let _ = std::fs::remove_file(&path);
         self.handoffs.borrow_mut().insert(sid.clone(), path.clone());
 
-        // Type the request, then press Enter separately so the TUI does not
-        // treat the newline as part of a paste.
-        term.feed_child(notes::handoff_request(&path).as_bytes());
-        glib::timeout_add_local_once(Duration::from_millis(250), move || term.feed_child(b"\r"));
+        type_into(&term, &notes::handoff_request(&path));
         self.flash("writing a handoff note. a fresh session opens when it is done");
     }
 
@@ -994,6 +1050,87 @@ impl App {
         self.select(&Row::Session(new_id));
         self.flash(&format!("handed off. note saved to {}", tilde(&path)));
         true
+    }
+
+    // ── messages between tasks ─────────────────────────────────────────────
+
+    fn process_requests(self: &Rc<Self>) {
+        for req in bus::take_all() {
+            match req {
+                Request::Send { from, to, text } => self.receive(&from, &to, &text),
+                Request::StartTask { from, title, agent, prompt } => {
+                    self.start_task_for(&from, &title, &agent, &prompt)
+                }
+            }
+        }
+    }
+
+    fn sender_label(&self, from: &str) -> String {
+        self.state
+            .borrow()
+            .session(from)
+            .map(|(_, s)| format!("\"{}\" ({})", s.title, s.agent))
+            .unwrap_or_else(|| "another task".into())
+    }
+
+    /// Delivers a message from another task: typed in now if the agent is
+    /// free, queued if it is busy, or used to start it if it is stopped.
+    fn receive(self: &Rc<Self>, from: &str, to: &str, text: &str) {
+        let Some(agent) = self.state.borrow().session(to).map(|(_, s)| s.agent.clone()) else { return };
+        let msg = format!("Message from Codebench task {}: {text}", self.sender_label(from));
+        let status = self.status_of(to);
+        if status.running() {
+            self.inbox.borrow_mut().entry(to.to_string()).or_default().push(msg);
+            if status.free() {
+                self.deliver_inbox(to);
+            }
+        } else if agents::takes_prompt_on_resume(&agent) {
+            self.launch(to, Some(&msg));
+        } else {
+            self.inbox.borrow_mut().entry(to.to_string()).or_default().push(msg);
+            self.launch(to, None);
+            // No hook reports when these agents are ready; give them a moment.
+            let b = self.clone();
+            let id = to.to_string();
+            glib::timeout_add_local_once(Duration::from_secs(5), move || b.deliver_inbox(&id));
+        }
+        self.rebuild_sidebar();
+    }
+
+    /// Types all queued messages into the task as one prompt.
+    fn deliver_inbox(self: &Rc<Self>, key: &str) {
+        let Some(msgs) = self.inbox.borrow_mut().remove(key) else { return };
+        let term = self.running.borrow().get(key).map(|r| r.term.clone());
+        match term {
+            Some(term) => type_into(&term, &msgs.join("\n\n")),
+            None => {
+                self.inbox.borrow_mut().insert(key.to_string(), msgs);
+            }
+        }
+    }
+
+    /// A task asked for a new task on its project; create and start it in the
+    /// background.
+    fn start_task_for(self: &Rc<Self>, from: &str, title: &str, agent: &str, prompt: &str) {
+        let Some(pid) = self.state.borrow().session(from).map(|(p, _)| p.id.clone()) else { return };
+        let starter = self.sender_label(from);
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut state = self.state.borrow_mut();
+            let Some(project) = state.project_mut(&pid) else { return };
+            project.sessions.push(Session {
+                id: id.clone(),
+                agent: agent.to_string(),
+                title: title.to_string(),
+                created: store::now(),
+                launched: false,
+                prompt: Some(format!("(Started by Codebench task {starter}.) {prompt}")),
+                archived: false,
+            });
+            state.save();
+        }
+        self.launch(&id, None);
+        self.flash(&format!("{starter} started a new task: {title}"));
     }
 
     // ── actions ────────────────────────────────────────────────────────────

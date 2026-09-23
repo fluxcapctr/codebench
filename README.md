@@ -55,6 +55,21 @@ Notes are plain markdown. By default they live in
 `~/.local/share/codebench/notes/`; link them into an Obsidian vault with
 `Ctrl+Shift+L` and the brief and handoffs come along.
 
+## Agents talking to each other
+
+Every Claude and Codex task gets a `codebench` MCP server with four tools:
+
+| Tool | What it does |
+| --- | --- |
+| `list_tasks` | The project's other tasks, their agent, status and context size |
+| `read_task` | The latest messages of another Claude task, or its handoff note |
+| `send_to_task` | Sends a message into another task. It is typed in when that agent is free, queued (shown as ✉) while it is busy, and starts the task if it is stopped |
+| `start_task` | Starts a new task on the project, with any agent, from an opening prompt |
+
+So you can tell one agent "have a Codex task review this" or "ask the
+refactor task what it changed", without copying anything between windows.
+Tasks only see tasks in their own project.
+
 ## Agents
 
 Claude Code, Codex, Gemini CLI, Grok Build, OpenCode, Antigravity and a plain
@@ -64,8 +79,9 @@ subscriptions apply.
 - **Claude Code** tasks keep a fixed session id and resume with `--resume`.
   Status (working, needs you, done) comes from hooks passed with `--settings`,
   layered on top of your own settings.
-- **Codex** reports "done" through its `notify` hook and resumes with
-  `codex resume`.
+- **Codex** reports "done" through its `notify` hook. Codebench finds the
+  task's own Codex conversation by a marker in its instructions and resumes
+  exactly that one.
 - Other agents report "needs you" when they ring the terminal bell.
 
 ## Files
@@ -73,5 +89,7 @@ subscriptions apply.
 - `~/.config/codebench/state.json`: projects and tasks
 - `~/.cache/codebench/status/`: per-task status written by agent hooks
 - `~/.local/share/codebench/notes/`: default notes folders
+- `~/.cache/codebench/requests/`: messages and new-task requests from agents
+- `~/.cache/codebench/tasks.json`: live task status, read by the MCP server
 - Theme: `~/.local/state/omarchy/current/theme/` (`colors.toml`, `ghostty.conf`)
 - Font: `~/.config/ghostty/config`
