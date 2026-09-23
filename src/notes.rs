@@ -100,6 +100,22 @@ pub fn next_title(title: &str) -> String {
     format!("{title} (2)")
 }
 
+/// The vault Obsidian last had open, from its own config.
+pub fn default_vault() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::store::home().join(".config"))
+        .join("obsidian/obsidian.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(config).ok()?).ok()?;
+    v["vaults"]
+        .as_object()?
+        .values()
+        .max_by_key(|vault| (vault["open"] == true, vault["ts"].as_u64().unwrap_or(0)))
+        .and_then(|vault| vault["path"].as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
 /// The Obsidian vault containing `dir`, if any.
 pub fn vault_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors().find(|d| d.join(".obsidian").is_dir()).map(Path::to_path_buf)
@@ -175,8 +191,8 @@ mod tests {
     #[test]
     fn uri_encodes_spaces() {
         assert_eq!(
-            obsidian_uri(Path::new("/home/e/Mission Control/a.md")),
-            "obsidian://open?path=/home/e/Mission%20Control/a.md"
+            obsidian_uri(Path::new("/home/e/My Vault/a.md")),
+            "obsidian://open?path=/home/e/My%20Vault/a.md"
         );
     }
 }

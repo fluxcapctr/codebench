@@ -1978,8 +1978,7 @@ impl App {
         };
         let dialog = gtk::FileDialog::new();
         dialog.set_title("Folder for this project's notes");
-        let vault = store::home().join("Documents/Mission Control");
-        let start = if vault.is_dir() { vault } else { store::home() };
+        let start = notes::default_vault().unwrap_or_else(store::home);
         dialog.set_initial_folder(Some(&gio::File::for_path(start)));
         let b = self.clone();
         dialog.select_folder(Some(&self.window), None::<&gio::Cancellable>, move |res| {
