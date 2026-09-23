@@ -1,0 +1,51 @@
+# Maintainer: Eric Stevens
+pkgname=codebench-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Terminal-first workspace for running coding agents across projects, styled by the active Omarchy theme"
+arch=('x86_64')
+url="https://github.com/fluxcapctr/codebench"
+license=('MIT')
+depends=('gtk4' 'vte4' 'git' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=(
+  'claude-code: Claude Code tasks'
+  'lazygit: the git pane'
+  'neovim: the notes editor when $EDITOR is unset'
+  'libnotify: desktop notifications'
+)
+provides=('codebench')
+conflicts=('codebench')
+source=("codebench::git+https://github.com/fluxcapctr/codebench.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd codebench
+  printf "%s.r%s.g%s" "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd codebench
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd codebench
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd codebench
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd codebench
+  install -Dm755 target/release/codebench "$pkgdir/usr/bin/codebench"
+  install -Dm644 codebench.desktop "$pkgdir/usr/share/applications/codebench.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -106,7 +106,7 @@ pub fn schedule(arg: Option<&str>) -> i32 {
             let dir = unit_dir();
             let _ = std::fs::create_dir_all(&dir);
             let service = format!(
-                "[Unit]\nDescription=Run due Codebench workflows\n\n[Service]\nType=oneshot\nEnvironment=PATH={path}\nExecStart={} run-due\n",
+                "[Unit]\nDescription=Run due Codebench workflows\n\n[Service]\nType=oneshot\nEnvironment=\"PATH={path}\"\nExecStart=\"{}\" run-due\n",
                 exe.display()
             );
             let timer = "[Unit]\nDescription=Check Codebench workflow schedules\n\n[Timer]\nOnCalendar=*:0/15\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n";

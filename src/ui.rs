@@ -41,6 +41,8 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+W", "stop task (select it again to resume)"),
     ("Ctrl+Shift+D", "delete task or remove project (press twice)"),
     ("Ctrl+Shift+A", "show or hide handed-off tasks"),
+    ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left"),
+    ("Ctrl+Shift+← / →", "focus the left or right side of a split"),
     ("Ctrl+Shift+B", "show or hide the sidebar"),
     ("Ctrl+Shift+C / V", "copy / paste"),
     ("Alt+Up / Down", "previous / next row"),
@@ -199,6 +201,12 @@ struct App {
     pending_merge: RefCell<Option<(String, Instant)>>,
     accounts: RefCell<Vec<Account>>,
     agents_label: gtk::Label,
+    paned: gtk::Paned,
+    side_box: gtk::Box,
+    side_header: gtk::Label,
+    side_holder: gtk::Box,
+    /// The task shown on the right of a split.
+    pinned: RefCell<Option<String>>,
     current_project: RefCell<Option<String>>,
     /// Terminal key of the row on screen, if it has one.
     current_key: RefCell<Option<String>>,
@@ -357,6 +365,24 @@ impl App {
 
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
+
+        // Right side of a split: one pinned task with its own title line.
+        let side_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        side_box.add_css_class("cb-split");
+        let side_header = label("cb-header");
+        side_header.set_ellipsize(pango::EllipsizeMode::End);
+        let side_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        side_holder.set_vexpand(true);
+        side_box.append(&side_header);
+        side_box.append(&side_holder);
+        side_box.set_visible(false);
+        let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        paned.set_wide_handle(false);
+        paned.set_start_child(Some(&overlay));
+        paned.set_end_child(Some(&side_box));
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_vexpand(true);
         let picker = Picker::build();
         overlay.add_overlay(&picker.root);
 
@@ -365,7 +391,7 @@ impl App {
         footer.set_ellipsize(pango::EllipsizeMode::End);
 
         main.append(&header);
-        main.append(&overlay);
+        main.append(&paned);
         main.append(&footer);
         root.append(&sidebar_box);
         root.append(&main);
@@ -402,6 +428,11 @@ impl App {
             pending_merge: RefCell::default(),
             accounts: RefCell::default(),
             agents_label: subs,
+            paned,
+            side_box,
+            side_header,
+            side_holder,
+            pinned: RefCell::default(),
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -835,9 +866,67 @@ impl App {
     fn focus_terminal(&self, key: &str) {
         let term = self.running.borrow().get(key).map(|r| r.term.clone());
         if let Some(term) = term {
-            self.stack.set_visible_child_name(key);
+            // A pinned task lives on the right; the left keeps its view.
+            if self.pinned.borrow().as_deref() != Some(key) {
+                self.stack.set_visible_child_name(key);
+            }
             term.grab_focus();
         }
+    }
+
+    /// Takes a terminal out of whichever side holds it.
+    fn detach(&self, key: &str, term: &vte::Terminal) {
+        if self.pinned.borrow().as_deref() == Some(key) {
+            self.side_holder.remove(term);
+            *self.pinned.borrow_mut() = None;
+            self.side_box.set_visible(false);
+        } else {
+            self.stack.remove(term);
+        }
+    }
+
+    /// Pins the current task to the right half, or unpins it.
+    fn toggle_split(self: &Rc<Self>) {
+        let pinned = self.pinned.borrow().clone();
+        if let Some(key) = pinned {
+            let term = self.running.borrow().get(&key).map(|r| r.term.clone());
+            *self.pinned.borrow_mut() = None;
+            self.side_box.set_visible(false);
+            if let Some(term) = term {
+                self.side_holder.remove(&term);
+                self.stack.add_named(&term, Some(&key));
+                if self.current_key.borrow().as_deref() == Some(key.as_str()) {
+                    self.focus_terminal(&key);
+                }
+            }
+            self.flash("split closed");
+            return;
+        }
+        let Some(key) = self.current_key.borrow().clone().filter(|k| !transient(k)) else {
+            self.flash("select a running task to pin it on the right");
+            return;
+        };
+        let Some(term) = self.running.borrow().get(&key).map(|r| r.term.clone()) else { return };
+        self.stack.remove(&term);
+        self.side_holder.append(&term);
+        *self.pinned.borrow_mut() = Some(key.clone());
+        let title = self.state.borrow().session(&key).map_or_else(
+            || "notes".to_string(),
+            |(p, s)| format!("{} › {}", p.name, s.title),
+        );
+        self.side_header.set_text(&format!("{title}      ^⇧S unpin"));
+        self.side_box.set_visible(true);
+        let width = self.paned.width();
+        if width > 0 {
+            self.paned.set_position(width / 2);
+        }
+        let pid = self.current_project.borrow().clone();
+        if let Some(pid) = pid {
+            self.select(&Row::Project(pid.clone()));
+            self.show_project(&pid);
+        }
+        term.grab_focus();
+        self.flash("pinned on the right. pick another task for the left side");
     }
 
     fn show_session(self: &Rc<Self>, sid: &str) {
@@ -983,8 +1072,9 @@ impl App {
             // Editor and git panes close themselves and return to where
             // you were.
             if transient(&id) {
-                if let Some(r) = b.running.borrow_mut().remove(&id) {
-                    b.stack.remove(&r.term);
+                let removed = b.running.borrow_mut().remove(&id);
+                if let Some(r) = removed {
+                    b.detach(&id, &r.term);
                 }
                 b.status.borrow_mut().remove(&id);
                 b.git_cache.borrow_mut().clear();
@@ -1815,6 +1905,19 @@ impl App {
                     });
                 }
                 gdk::Key::b => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
+                gdk::Key::s => self.toggle_split(),
+                gdk::Key::Left => {
+                    let key = self.current_key.borrow().clone();
+                    if let Some(t) = key.and_then(|k| self.running.borrow().get(&k).map(|r| r.term.clone())) {
+                        t.grab_focus();
+                    }
+                }
+                gdk::Key::Right => {
+                    let key = self.pinned.borrow().clone();
+                    if let Some(t) = key.and_then(|k| self.running.borrow().get(&k).map(|r| r.term.clone())) {
+                        t.grab_focus();
+                    }
+                }
                 gdk::Key::c => {
                     if let Some(t) = self.current_term() {
                         t.copy_clipboard_format(vte::Format::Text);
@@ -1955,8 +2058,9 @@ impl App {
         };
         for key in &doomed {
             self.stop(key);
-            if let Some(r) = self.running.borrow_mut().remove(key) {
-                self.stack.remove(&r.term);
+            let removed = self.running.borrow_mut().remove(key);
+            if let Some(r) = removed {
+                self.detach(key, &r.term);
             }
             self.status.borrow_mut().remove(key);
         }

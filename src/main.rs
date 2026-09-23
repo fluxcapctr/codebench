@@ -29,6 +29,8 @@ const PARENT_SESSION_VARS: &[&str] = &[
 ];
 
 fn main() -> gtk::glib::ExitCode {
+    store::make_private_dirs();
+
     // `codebench mcp --session <id>`: the per-task MCP server agents launch.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("mcp") {

@@ -10,10 +10,19 @@ live when you switch themes.
 
 ## Install
 
+On Arch or Omarchy:
+
 ```sh
 sudo pacman -S vte4
+git clone https://github.com/fluxcapctr/codebench && cd codebench
 ./install.sh
 ```
+
+Or build the package in `packaging/aur` with `makepkg -si`.
+
+Codebench drives the agent CLIs you already have (Claude Code, Codex,
+Gemini CLI, Grok Build, OpenCode, Antigravity), each on its own login.
+lazygit is used for the git pane.
 
 ## Use
 
@@ -39,6 +48,8 @@ codebench ~/code/some-project   # add a project and open it
 | `Ctrl+Shift+W` | Stop the task's agent (select it again to resume) |
 | `Ctrl+Shift+D` | Delete the task, or remove the project (press twice) |
 | `Ctrl+Shift+A` | Show or hide handed-off tasks |
+| `Ctrl+Shift+S` | Split: pin this task on the right, pick another for the left; again to unpin |
+| `Ctrl+Shift+←/→` | Focus the left or right side of a split |
 | `Ctrl+Shift+B` | Toggle the sidebar |
 | `Ctrl+Shift+C/V` | Copy and paste |
 | `Alt+Up/Down` | Move through projects, notes and tasks |
@@ -156,3 +167,21 @@ subscriptions apply.
 - `~/.config/codebench/schedule.json`: when each scheduled workflow last ran
 - Theme: `~/.local/state/omarchy/current/theme/` (`colors.toml`, `ghostty.conf`)
 - Font: `~/.config/ghostty/config`
+
+## Trust and safety
+
+Codebench runs agents with the permissions you already gave them; it adds no
+sandbox of its own. Things worth knowing:
+
+- **Agents can prompt each other.** Through the MCP tools a task can type a
+  message into another task on the same project, or start a new one. A task
+  never reaches other projects.
+- **Notes are instructions.** The brief is given to every Claude and Codex
+  task, and workflows are prompts. If the notes folder lives in a shared or
+  synced place (such as an Obsidian vault other agents write to), whoever can
+  edit it can steer your agents, and scheduled workflows will run what it
+  says without you watching.
+- **Background runs are unattended.** `codebench schedule on` runs due
+  workflows while you are away, with the agent's usual permission settings.
+- **Local files.** Codebench's folders are created readable by you only,
+  since anything that can write to them can prompt your agents.

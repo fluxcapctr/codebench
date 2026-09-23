@@ -113,6 +113,16 @@ pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into())
 }
 
+/// Creates Codebench's folders readable by you only. Anything that can
+/// write to the request or status folders can prompt your agents.
+pub fn make_private_dirs() {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in [config_dir(), cache_dir(), data_dir()] {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

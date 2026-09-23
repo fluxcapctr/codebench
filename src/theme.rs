@@ -168,6 +168,8 @@ list > row:selected label {{ color: {fg}; }}
 .cb-footer.cb-flash {{ color: {accent}; }}
 vte-terminal {{ padding: 6px 10px; }}
 .cb-empty {{ color: {muted}; }}
+.cb-split {{ border-left: 1px solid {muted}; }}
+paned > separator {{ background: {muted}; min-width: 1px; }}
 .cb-picker {{ background: {dark}; border: 1px solid {accent}; padding: 10px; }}
 .cb-picker-title {{ color: {accent}; font-weight: bold; margin-bottom: 6px; }}
 .cb-picker entry {{ background: {bg}; color: {fg}; border: 1px solid {muted}; padding: 4px 8px; min-height: 0; caret-color: {accent}; outline: none; }}
