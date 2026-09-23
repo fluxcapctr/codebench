@@ -58,6 +58,9 @@ pub struct Project {
     /// can point into an Obsidian vault.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<PathBuf>,
+    /// Give this project's Claude and Codex tasks a browser to drive.
+    #[serde(default)]
+    pub browser: bool,
 }
 
 impl Project {
@@ -209,6 +212,7 @@ impl State {
             path,
             sessions: Vec::new(),
             notes: None,
+            browser: false,
         });
         self.save();
         id

@@ -452,6 +452,7 @@ mod tests {
             path: "/tmp".into(),
             sessions: Vec::new(),
             notes: None,
+            browser: false,
         };
         let dir = std::env::temp_dir().join(format!("cb-wf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

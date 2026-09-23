@@ -48,6 +48,7 @@ codebench ~/code/some-project   # add a project and open it
 | `Ctrl+Shift+W` | Stop the task's agent (select it again to resume) |
 | `Ctrl+Shift+D` | Delete the task, or remove the project (press twice) |
 | `Ctrl+Shift+A` | Show or hide handed-off tasks |
+| `Ctrl+Shift+K` | Give this project's agents a browser (on or off) |
 | `Ctrl+Shift+S` | Split: pin this task on the right, pick another for the left; again to unpin |
 | `Ctrl+Shift+←/→` | Focus the left or right side of a split |
 | `Ctrl+Shift+B` | Toggle the sidebar |
@@ -156,6 +157,16 @@ While any agent is working, Codebench holds a `systemd-inhibit` sleep lock
 so the machine does not suspend mid-task. The screen still locks as usual.
 
 Drop files onto a task to type their paths into it.
+
+## A browser for agents
+
+`Ctrl+Shift+K` gives a project's Claude and Codex tasks a browser: Playwright's
+MCP server driving a visible Chromium window, so an agent can open your dev
+server, click, fill forms, read the page and take screenshots while you
+watch. Each task keeps its own browser profile, so logins survive resumes
+and two tasks never fight over one. It is off by default because its tools
+add to every task's context; the sidebar marks projects that have it with ◍.
+Needs node (`npx`); uses your installed Chromium.
 
 ## Accounts and past chats
 

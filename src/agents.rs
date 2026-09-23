@@ -99,6 +99,54 @@ fn mcp_server(session: &Session) -> (String, Vec<String>, serde_json::Map<String
     (exe, args, env)
 }
 
+/// Chromium or Chrome, whichever is installed.
+pub fn chromium() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"]
+        .iter()
+        .find_map(|name| std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file()))
+}
+
+/// The Playwright MCP server that gives a task a browser: a visible
+/// Chromium window with its own profile, kept per task so logins survive
+/// resumes and tasks never share a locked profile.
+fn browser_server(session: &Session) -> (String, Vec<String>, serde_json::Map<String, serde_json::Value>) {
+    let profile = store::data_dir().join("browser").join(&session.id);
+    let shots = store::cache_dir().join("browser").join(&session.id);
+    let mut args = vec![
+        "-y".to_string(),
+        "@playwright/mcp@latest".to_string(),
+        "--browser".to_string(),
+        "chromium".to_string(),
+        "--user-data-dir".to_string(),
+        profile.to_string_lossy().into_owned(),
+        "--output-dir".to_string(),
+        shots.to_string_lossy().into_owned(),
+    ];
+    if let Some(exe) = chromium() {
+        args.extend(["--executable-path".to_string(), exe.to_string_lossy().into_owned()]);
+    }
+    let npx = real_program("npx");
+    // npx starts node through `env`, so node's own folder goes first on PATH.
+    let mut env = serde_json::Map::new();
+    if let Some(dir) = npx.as_deref().and_then(|p| Path::new(p).parent()) {
+        let rest = std::env::var("PATH").unwrap_or_default();
+        env.insert("PATH".into(), format!("{}:{rest}", dir.display()).into());
+    }
+    (npx.unwrap_or_else(|| "npx".into()), args, env)
+}
+
+/// The first real executable named `program` on PATH, skipping mise shims,
+/// which fail when an agent runs them from a folder without a mise config.
+fn real_program(program: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|d| !d.to_string_lossy().contains("/mise/shims"))
+        .map(|d| d.join(program))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Builds the argv for a session. Resumes the previous conversation when there
 /// is one; otherwise starts fresh. The opening prompt is `extra` if given,
 /// else the session's own (fresh starts only).
@@ -115,9 +163,13 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
             } else {
                 argv.extend([s("--session-id"), session.id.clone(), s("-n"), session.title.clone()]);
             }
-            let mcp = serde_json::json!({
+            let mut mcp = serde_json::json!({
                 "mcpServers": { "codebench": { "type": "stdio", "command": mcp_cmd, "args": mcp_args, "env": mcp_env } }
             });
+            if project.browser {
+                let (cmd, args, env) = browser_server(session);
+                mcp["mcpServers"]["browser"] = serde_json::json!({ "type": "stdio", "command": cmd, "args": args, "env": env });
+            }
             argv.extend([
                 s("--settings"),
                 claude_settings(),
@@ -156,6 +208,17 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
                 s("-c"),
                 format!("mcp_servers.codebench.env={}", toml_inline_table(&mcp_env)),
             ];
+            if project.browser {
+                let (cmd, args, env) = browser_server(session);
+                argv.extend([
+                    s("-c"),
+                    format!("mcp_servers.browser.command={}", serde_json::Value::String(cmd)),
+                    s("-c"),
+                    format!("mcp_servers.browser.args={}", serde_json::json!(args)),
+                    s("-c"),
+                    format!("mcp_servers.browser.env={}", toml_inline_table(&env)),
+                ]);
+            }
             // No `--add-dir` for Codex: under a read-only sandbox it refuses
             // the flag and exits. It can still read the notes folder.
             match codex_session(session) {

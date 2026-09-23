@@ -42,6 +42,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+W", "stop task (select it again to resume)"),
     ("Ctrl+Shift+D", "delete task or remove project (press twice)"),
     ("Ctrl+Shift+A", "show or hide handed-off tasks"),
+    ("Ctrl+Shift+K", "give this project's agents a browser (on or off)"),
     ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left"),
     ("Ctrl+Shift+← / →", "focus the left or right side of a split"),
     ("Ctrl+Shift+B", "show or hide the sidebar"),
@@ -515,12 +516,21 @@ impl App {
                 Some(Row::Project(pid)) => b.show_project(&pid),
                 Some(Row::Notes(pid)) => b.show_notes(&pid),
                 Some(Row::Git(pid)) => {
-                    let path = b.state.borrow().project(&pid).map(|p| p.path.clone());
-                    if let Some(path) = path {
-                        *b.current_project.borrow_mut() = Some(pid.clone());
-                        *b.return_to.borrow_mut() = Some(Row::Project(pid));
-                        b.open_git(&path);
-                    }
+                    // Like tasks, open only if the row is still selected a
+                    // moment later, so moving past it does not start lazygit.
+                    let b2 = b.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                        let still = b2.sidebar.selected_row().and_then(|r| b2.rows.borrow().get(r.index() as usize).cloned());
+                        if still != Some(Row::Git(pid.clone())) {
+                            return;
+                        }
+                        let path = b2.state.borrow().project(&pid).map(|p| p.path.clone());
+                        if let Some(path) = path {
+                            *b2.current_project.borrow_mut() = Some(pid.clone());
+                            *b2.return_to.borrow_mut() = Some(Row::Project(pid));
+                            b2.open_git(&path);
+                        }
+                    });
                 }
                 Some(Row::Session(sid)) => b.show_session(&sid),
                 None => {}
@@ -715,7 +725,8 @@ impl App {
             } else {
                 String::new()
             };
-            let row = row_with(&format!("<b>{}</b>{badge}", esc(&p.name)));
+            let web = if p.browser { format!("  <span foreground='{}'>◍</span>", theme.muted) } else { String::new() };
+            let row = row_with(&format!("<b>{}</b>{web}{badge}", esc(&p.name)));
             row.add_css_class("cb-project");
             self.sidebar.append(&row);
             rows.push(Row::Project(p.id.clone()));
@@ -877,6 +888,7 @@ impl App {
         let dim = |s: &str| format!("<span foreground='{}'>{}</span>", t.muted, esc(s));
         let mut out = format!("<span foreground='{}' size='large'><b>{}</b></span>   {}\n", t.accent, esc(&p.name), dim(&tilde(&p.path)));
         let brief = if notes::brief(p).is_some() { "brief written" } else { "no brief yet (^⇧E)" };
+        let brief = if p.browser { format!("{brief}   ·   browser on (^⇧K)") } else { brief.to_string() };
         out.push_str(&format!("{}\n\n", dim(&format!("{brief}   ·   notes in {}", tilde(&p.notes_dir())))));
 
         let live: Vec<&Session> = p.sessions.iter().filter(|s| !s.archived).collect();
@@ -1839,6 +1851,41 @@ impl App {
         self.update_header();
     }
 
+    /// Gives the project's Claude and Codex tasks a browser (Playwright's MCP
+    /// server with a visible Chromium), or takes it away. Applies to tasks
+    /// as they start or resume.
+    fn toggle_browser(self: &Rc<Self>) {
+        let Some(pid) = self.current_project.borrow().clone() else {
+            self.flash("select a project first");
+            return;
+        };
+        if !agents::on_path("npx") {
+            self.flash("the browser needs node (npx). install it, for example with mise use -g node");
+            return;
+        }
+        let on = {
+            let mut state = self.state.borrow_mut();
+            let Some(p) = state.project_mut(&pid) else { return };
+            p.browser = !p.browser;
+            let on = p.browser;
+            state.save();
+            on
+        };
+        self.rebuild_sidebar();
+        let running = self
+            .state
+            .borrow()
+            .project(&pid)
+            .is_some_and(|p| p.sessions.iter().any(|s| self.status_of(&s.id).running()));
+        let restart = if running { " running tasks pick it up when restarted (^⇧W, then select them)" } else { "" };
+        if on {
+            let chrome = if agents::chromium().is_some() { "" } else { " (no chromium found: playwright will download its own)" };
+            self.flash(&format!("browser on: agents can open pages, click, type and take screenshots{chrome}.{restart}"));
+        } else {
+            self.flash(&format!("browser off.{restart}"));
+        }
+    }
+
     // ── workflows ──────────────────────────────────────────────────────────
 
     fn open_workflows(self: &Rc<Self>) {
@@ -2103,6 +2150,7 @@ impl App {
                 }
                 gdk::Key::b => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
                 gdk::Key::s => self.toggle_split(),
+                gdk::Key::k => self.toggle_browser(),
                 gdk::Key::Left => {
                     let key = self.current_key.borrow().clone();
                     if let Some(t) = key.and_then(|k| self.running.borrow().get(&k).map(|r| r.term.clone())) {
