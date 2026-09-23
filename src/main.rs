@@ -1,7 +1,9 @@
 mod agents;
+mod notes;
 mod store;
 mod theme;
 mod ui;
+mod usage;
 
 /// Markers a parent Claude Code session sets. Inherited by the agents we
 /// spawn, they make Claude treat itself as a subagent and stop saving

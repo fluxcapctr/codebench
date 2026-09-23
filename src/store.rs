@@ -15,6 +15,12 @@ pub struct Session {
     /// resume instead of starting fresh.
     #[serde(default)]
     pub launched: bool,
+    /// Sent as the opening prompt on the first launch only (used by handoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Handed off to a newer task; hidden from the sidebar unless shown.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -24,6 +30,19 @@ pub struct Project {
     pub path: PathBuf,
     #[serde(default)]
     pub sessions: Vec<Session>,
+    /// Where the brief and handoffs live. Defaults to Codebench's data dir;
+    /// can point into an Obsidian vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<PathBuf>,
+}
+
+impl Project {
+    pub fn notes_dir(&self) -> PathBuf {
+        self.notes.clone().unwrap_or_else(|| {
+            let short: String = self.id.chars().take(8).collect();
+            data_dir().join("notes").join(format!("{}-{short}", self.name))
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -43,6 +62,13 @@ pub fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".cache"))
+        .join("codebench")
+}
+
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local/share"))
         .join("codebench")
 }
 
@@ -120,6 +146,7 @@ impl State {
             name,
             path,
             sessions: Vec::new(),
+            notes: None,
         });
         self.save();
         id

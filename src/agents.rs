@@ -5,8 +5,9 @@
 //! comes back through the file named by `$CODEBENCH_STATUS`, which the agent's
 //! own hook system writes to.
 
-use crate::store::{Session, home};
-use std::path::Path;
+use crate::notes;
+use crate::store::{Project, Session, home};
+use std::path::{Path, PathBuf};
 
 pub struct Agent {
     pub id: &'static str,
@@ -66,9 +67,9 @@ fn claude_settings() -> String {
     .to_string()
 }
 
-/// True when Claude Code has a transcript for this session id, meaning
-/// `--resume` will find it.
-fn claude_transcript_exists(id: &str) -> bool {
+/// Claude Code's transcript for this session id, if it has written one.
+/// Its presence means `--resume` will find the conversation.
+pub fn claude_transcript(id: &str) -> Option<PathBuf> {
     let root = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(Into::into)
         .unwrap_or_else(|| home().join(".claude"))
@@ -78,29 +79,54 @@ fn claude_transcript_exists(id: &str) -> bool {
         .into_iter()
         .flatten()
         .flatten()
-        .any(|dir| dir.path().join(&file).is_file())
+        .map(|dir| dir.path().join(&file))
+        .find(|path| path.is_file())
 }
 
 /// Builds the argv for a session. Resumes the previous conversation when there
-/// is one to resume.
-pub fn argv(session: &Session) -> Vec<String> {
+/// is one; otherwise starts fresh, with the session's opening prompt if set.
+pub fn argv(session: &Session, project: &Project) -> Vec<String> {
     let s = |v: &str| v.to_string();
+    let notes = project.notes_dir().to_string_lossy().into_owned();
+    let context = notes::agent_context(project);
     match session.agent.as_str() {
         "claude" => {
             let mut argv = vec![s("claude")];
-            if claude_transcript_exists(&session.id) {
+            let resume = claude_transcript(&session.id).is_some();
+            if resume {
                 argv.extend([s("--resume"), session.id.clone()]);
             } else {
                 argv.extend([s("--session-id"), session.id.clone(), s("-n"), session.title.clone()]);
             }
-            argv.extend([s("--settings"), claude_settings()]);
+            argv.extend([
+                s("--settings"),
+                claude_settings(),
+                s("--add-dir"),
+                notes,
+                s("--append-system-prompt"),
+                context,
+            ]);
+            if !resume && let Some(prompt) = &session.prompt {
+                // `--add-dir` takes several values, so end options first.
+                argv.extend([s("--"), prompt.clone()]);
+            }
             argv
         }
         "codex" => {
             let notify = serde_json::json!(["sh", "-c", write_status("done")]);
-            let mut argv = vec![s("codex"), s("-c"), format!("notify={notify}")];
+            let mut argv = vec![
+                s("codex"),
+                s("-c"),
+                format!("notify={notify}"),
+                s("-c"),
+                format!("developer_instructions={}", serde_json::Value::String(context)),
+                s("--add-dir"),
+                notes,
+            ];
             if session.launched {
                 argv.push(s("resume"));
+            } else if let Some(prompt) = &session.prompt {
+                argv.push(prompt.clone());
             }
             argv
         }
@@ -109,12 +135,17 @@ pub fn argv(session: &Session) -> Vec<String> {
     }
 }
 
+/// Agents that can write a handoff note and start from an opening prompt.
+pub fn supports_handoff(agent: &str) -> bool {
+    matches!(agent, "claude" | "codex")
+}
+
 /// Whether the agent reports "done" on its own, so Codebench can mark it as
 /// working when you send it a prompt.
 pub fn reports_done(agent: &str) -> bool {
     matches!(agent, "codex")
 }
 
-pub fn status_file(dir: &Path, session: &str) -> std::path::PathBuf {
+pub fn status_file(dir: &Path, session: &str) -> PathBuf {
     dir.join(session)
 }
