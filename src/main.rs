@@ -53,6 +53,7 @@ fn main() -> gtk::glib::ExitCode {
             headless::status(args.iter().any(|a| a == "--follow"));
             std::process::exit(0);
         }
+        Some("workflows") => std::process::exit(workflow::cli(&args[2..])),
         Some("accounts") => {
             for a in accounts::check_all() {
                 let update = a.update.map(|(c, l)| format!("   (update {c} -> {l})")).unwrap_or_default();

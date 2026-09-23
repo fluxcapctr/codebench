@@ -112,6 +112,25 @@ same workflow are archived. Schedules can be `hourly`, `every 6h`,
 `daily 18:30`, `weekdays 09:00`, `weekends 10:00` or `mon,thu 08:00`. A new
 schedule waits for its next time instead of firing at once.
 
+Global workflows can be scheduled too: add `projects: all` (or
+`projects: compy, omaform`) to say which projects the schedule runs in.
+
+**Starter set.** `workflows/` in this repo holds nine ready-made workflows
+(review changes, commit my work, release notes, dependency check, run tests
+and fix, refresh brief, whats changed, codex second opinion, security
+review). `install.sh` copies them to `~/.config/codebench/workflows/` if you
+have none yet.
+
+**Collections.** Share workflow sets through git:
+
+```sh
+codebench workflows add https://github.com/someone/their-workflows
+codebench workflows update    # pull every collection
+codebench workflows           # list global and collection workflows
+```
+
+A collection's workflows show in every project, marked with its name.
+
 Scheduled workflows run while Codebench is open. To also run them while it is
 closed:
 

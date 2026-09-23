@@ -15,3 +15,10 @@ if [ -d "$plugins" ] && [ ! -e "$plugins/io.github.fluxcapctr.codebench" ]; then
   ln -s "$PWD/plugin" "$plugins/io.github.fluxcapctr.codebench"
   echo "linked the bar widget. add it with: omarchy bar put io.github.fluxcapctr.codebench"
 fi
+
+# Starter workflows, only if you have none yet.
+wf="${XDG_CONFIG_HOME:-$HOME/.config}/codebench/workflows"
+if [ ! -d "$wf" ]; then
+  mkdir -p "$wf" && cp workflows/*.md "$wf"/
+  echo "added starter workflows to $wf"
+fi

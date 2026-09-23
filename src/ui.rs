@@ -928,10 +928,14 @@ impl App {
                     (None, Some(text)) => format!("  ·  can't read schedule \"{text}\""),
                     _ => String::new(),
                 };
-                let scope = if wf.global { "  (global)" } else { "" };
+                let scope = match (&wf.collection, wf.global) {
+                    (Some(c), _) => format!("  ({c})"),
+                    (None, true) => "  (global)".to_string(),
+                    _ => String::new(),
+                };
                 out.push_str(&format!("  {}{}\n", esc(&wf.name), dim(&format!("{when}{scope}"))));
             }
-            if flows.iter().any(|w| w.schedule.is_some() && !w.global) && !headless::timer_installed() {
+            if flows.iter().any(|w| w.schedule.is_some() && w.scheduled_for(p)) && !headless::timer_installed() {
                 out.push_str(&dim("  scheduled runs happen while codebench is open; codebench schedule on also runs them while it is closed"));
                 out.push('\n');
             }
@@ -1866,7 +1870,11 @@ impl App {
                         (None, Some(_)) => "bad schedule".into(),
                         _ => String::new(),
                     };
-                    let scope = if wf.global { " (global)" } else { "" };
+                    let scope = match (&wf.collection, wf.global) {
+                        (Some(c), _) => format!(" ({c})"),
+                        (None, true) => " (global)".to_string(),
+                        _ => String::new(),
+                    };
                     format!("{:<26}{:<9}{when}{scope}", wf.name, wf.agent)
                 }
                 None if filter.is_empty() => "+ new workflow".into(),
@@ -1951,7 +1959,9 @@ impl App {
         let now = store::now();
         let projects = self.state.borrow().projects.clone();
         for (pid, wf) in workflow::due(&projects, now) {
-            workflow::mark_ran(&wf, now);
+            if let Some(project) = projects.iter().find(|p| p.id == pid) {
+                workflow::mark_ran(&wf, project, now);
+            }
             self.run_workflow(&pid, &wf, false);
             self.flash(&format!("scheduled workflow started: {}", wf.name));
         }

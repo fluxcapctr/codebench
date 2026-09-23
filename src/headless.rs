@@ -38,7 +38,8 @@ pub fn run_due() {
 /// Runs one workflow to completion without a terminal, saves the agent's
 /// final answer next to the notes, and records it as a resumable task.
 fn run(pid: &str, wf: &Workflow, now: u64) {
-    workflow::mark_ran(wf, now);
+    let Some(project) = State::load().project(pid).cloned() else { return };
+    workflow::mark_ran(wf, &project, now);
     let session = Session {
         id: uuid::Uuid::new_v4().to_string(),
         agent: wf.agent.clone(),
@@ -51,7 +52,6 @@ fn run(pid: &str, wf: &Workflow, now: u64) {
         worktree: None,
         codex_id: None,
     };
-    let Some(project) = State::load().project(pid).cloned() else { return };
     let Some(argv) = agents::headless_argv(&session, &project, &wf.prompt) else {
         notify(&format!("{}: {}", project.name, wf.name), &format!("{} cannot run in the background", wf.agent));
         return;

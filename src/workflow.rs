@@ -31,12 +31,24 @@ pub struct Workflow {
     pub schedule_text: Option<String>,
     pub prompt: String,
     pub global: bool,
+    /// The collection it came from, for workflows shared through git.
+    pub collection: Option<String>,
+    /// For global workflows: the projects a schedule runs it in, by name,
+    /// or "all".
+    pub projects: Vec<String>,
+}
+
+impl Workflow {
+    /// Whether a global workflow's schedule covers this project.
+    pub fn scheduled_for(&self, project: &Project) -> bool {
+        !self.global || self.projects.iter().any(|p| p == "all" || p.eq_ignore_ascii_case(&project.name))
+    }
 }
 
 pub const TEMPLATE: &str = "\
 ---
 agent: claude
-# schedule: weekdays 09:00    (or: daily 18:30, mon,thu 08:00, hourly, every 6h)
+# schedule: weekdays 09:00    # or: daily 18:30, mon,thu 08:00, hourly, every 6h
 ---
 Describe what the agent should do each time this workflow runs.
 ";
@@ -47,6 +59,11 @@ pub fn project_dir(project: &Project) -> PathBuf {
 
 pub fn global_dir() -> PathBuf {
     config_dir().join("workflows")
+}
+
+/// Workflow sets cloned from git with `codebench workflows add`.
+pub fn collections_dir() -> PathBuf {
+    config_dir().join("collections")
 }
 
 const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -105,6 +122,8 @@ fn frontmatter(text: &str) -> (HashMap<String, String>, String) {
             continue;
         }
         if let Some((k, v)) = line.split_once(':') {
+            // " # ..." after a value is a comment.
+            let v = v.split(" #").next().unwrap_or("");
             meta.insert(k.trim().to_lowercase(), v.trim().to_string());
         }
     }
@@ -129,6 +148,11 @@ pub fn parse(path: &Path, global: bool) -> Option<Workflow> {
         schedule_text,
         prompt,
         global,
+        collection: None,
+        projects: meta
+            .get("projects")
+            .map(|p| p.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -145,10 +169,33 @@ fn list_dir(dir: &Path, global: bool) -> Vec<Workflow> {
     out
 }
 
+/// Workflows from every collection, marked with the collection's name. A
+/// collection may keep them at its top level or in a `workflows/` folder.
+fn list_collections() -> Vec<Workflow> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(collections_dir()).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let root = entry.path();
+        let dir = if root.join("workflows").is_dir() { root.join("workflows") } else { root };
+        out.extend(list_dir(&dir, true).into_iter().map(|mut w| {
+            w.collection = Some(name.clone());
+            w
+        }));
+    }
+    out
+}
+
+/// Global workflows: your own, then collections'.
+pub fn list_global() -> Vec<Workflow> {
+    let mut out = list_dir(&global_dir(), true);
+    out.extend(list_collections());
+    out
+}
+
 /// The project's workflows, then global ones.
 pub fn list(project: &Project) -> Vec<Workflow> {
     let mut out = list_dir(&project_dir(project), false);
-    out.extend(list_dir(&global_dir(), true));
+    out.extend(list_global());
     out
 }
 
@@ -243,10 +290,13 @@ pub fn due(projects: &[Project], now: u64) -> Vec<(String, Workflow)> {
     let mut runs = load_runs();
     let mut changed = false;
     let mut out = Vec::new();
+    let global = list_global();
     for project in projects {
-        for wf in list_dir(&project_dir(project), false) {
+        let own = list_dir(&project_dir(project), false);
+        let shared = global.iter().filter(|w| w.scheduled_for(project)).cloned();
+        for wf in own.into_iter().chain(shared) {
             let Some(schedule) = &wf.schedule else { continue };
-            let key = wf.path.to_string_lossy().into_owned();
+            let key = run_key(&wf, project);
             match runs.get(&key) {
                 None => {
                     runs.insert(key, now);
@@ -263,10 +313,94 @@ pub fn due(projects: &[Project], now: u64) -> Vec<(String, Workflow)> {
     out
 }
 
-pub fn mark_ran(wf: &Workflow, now: u64) {
+/// Schedule records are per workflow, and for global ones per project too.
+fn run_key(wf: &Workflow, project: &Project) -> String {
+    if wf.global {
+        format!("{}#{}", wf.path.display(), project.id)
+    } else {
+        wf.path.to_string_lossy().into_owned()
+    }
+}
+
+pub fn mark_ran(wf: &Workflow, project: &Project, now: u64) {
     let mut runs = load_runs();
-    runs.insert(wf.path.to_string_lossy().into_owned(), now);
+    runs.insert(run_key(wf, project), now);
     save_runs(&runs);
+}
+
+// ── collections ────────────────────────────────────────────────────────────
+
+fn git(args: &[&str], dir: Option<&Path>) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(dir) = dir {
+        cmd.arg("-C").arg(dir);
+    }
+    let out = cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// `codebench workflows add|update|list`.
+pub fn cli(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let Some(url) = args.get(1) else {
+                eprintln!("usage: codebench workflows add <git url> [name]");
+                return 2;
+            };
+            let name = args.get(2).cloned().unwrap_or_else(|| {
+                url.trim_end_matches('/').trim_end_matches(".git").rsplit(['/', ':']).next().unwrap_or("collection").to_string()
+            });
+            let name = slug(&name);
+            let dest = collections_dir().join(&name);
+            if dest.exists() {
+                eprintln!("a collection named {name} already exists. codebench workflows update refreshes it");
+                return 1;
+            }
+            let _ = std::fs::create_dir_all(collections_dir());
+            match git(&["clone", "--depth", "1", "--", url, &dest.to_string_lossy()], None) {
+                Ok(()) => {
+                    let n = list_collections().iter().filter(|w| w.collection.as_deref() == Some(&name)).count();
+                    println!("added {name}: {n} workflows");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("could not clone {url}: {e}");
+                    1
+                }
+            }
+        }
+        Some("update") => {
+            let mut failed = 0;
+            for entry in std::fs::read_dir(collections_dir()).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                match git(&["pull", "--ff-only", "--quiet"], Some(&entry.path())) {
+                    Ok(()) => println!("{name}: up to date"),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{name}: {e}");
+                    }
+                }
+            }
+            i32::from(failed > 0)
+        }
+        Some("list") | None => {
+            for wf in list_global() {
+                let from = wf.collection.as_deref().unwrap_or("yours");
+                let when = wf.schedule_text.as_deref().map(|s| format!("  [{s}]")).unwrap_or_default();
+                println!("{:<28}{:<9}{from}{when}", wf.name, wf.agent);
+            }
+            println!("\nproject workflows live in each project's notes/workflows folder");
+            0
+        }
+        _ => {
+            eprintln!("usage: codebench workflows [list | add <git url> [name] | update]");
+            2
+        }
+    }
 }
 
 /// Short local date and time for run titles, e.g. "09-24 09:00".
@@ -311,8 +445,31 @@ mod tests {
     }
 
     #[test]
+    fn global_schedules_name_their_projects() {
+        let project = |name: &str| Project {
+            id: "id".into(),
+            name: name.into(),
+            path: "/tmp".into(),
+            sessions: Vec::new(),
+            notes: None,
+        };
+        let dir = std::env::temp_dir().join(format!("cb-wf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("check.md");
+        std::fs::write(&file, "---\nschedule: daily 09:00\nprojects: Compy, omaform\n---\nDo it.\n").unwrap();
+        let wf = parse(&file, true).unwrap();
+        assert!(wf.scheduled_for(&project("compy")));
+        assert!(!wf.scheduled_for(&project("deep")));
+        std::fs::write(&file, "---\nschedule: daily 09:00\n---\nDo it.\n").unwrap();
+        assert!(!parse(&file, true).unwrap().scheduled_for(&project("compy")));
+        std::fs::write(&file, "---\nschedule: daily 09:00\nprojects: all\n---\nDo it.\n").unwrap();
+        assert!(parse(&file, true).unwrap().scheduled_for(&project("deep")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reads_frontmatter() {
-        let (meta, body) = frontmatter("---\nagent: codex\n# note\nschedule: daily 09:00\n---\nDo the thing.\n");
+        let (meta, body) = frontmatter("---\nagent: codex\n# note\nschedule: daily 09:00   # every day\n---\nDo the thing.\n");
         assert_eq!(meta["agent"], "codex");
         assert_eq!(meta["schedule"], "daily 09:00");
         assert_eq!(body, "Do the thing.");
