@@ -7,6 +7,8 @@ use crate::notes;
 use crate::store::{self, Session, State};
 use crate::theme::{self, Theme};
 use crate::usage;
+use crate::workflow::{self, Workflow};
+use crate::headless;
 use gtk::{gdk, gio, glib, pango, prelude::*};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -17,10 +19,11 @@ use vte::prelude::*;
 
 pub const APP_ID: &str = "co.ericstevens.codebench";
 
-const HINTS: &str = "^⇧N new task   ^⇧E notes   ^⇧H handoff   ^⇧O add project   alt ↑↓ switch   F1 all keys";
+const HINTS: &str = "^⇧N new task   ^⇧P workflows   ^⇧E notes   ^⇧H handoff   ^⇧O add project   alt ↑↓ switch   F1 all keys";
 
 const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+N", "new task in this project"),
+    ("Ctrl+Shift+P", "workflows: run, edit (^E) or create saved prompts"),
     ("Ctrl+Shift+E", "edit project notes (brief and handoffs)"),
     ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session"),
     ("Ctrl+Shift+O", "add a project folder"),
@@ -114,6 +117,7 @@ enum PickerMode {
     NewTask,
     Rename(String),
     Help,
+    Workflows(String),
 }
 
 struct Picker {
@@ -124,6 +128,8 @@ struct Picker {
     mode: RefCell<PickerMode>,
     /// Agent ids, one per list row, in NewTask mode.
     items: RefCell<Vec<&'static str>>,
+    /// Workflow rows in Workflows mode; None is the "new workflow" row.
+    workflows: RefCell<Vec<Option<Workflow>>>,
 }
 
 struct Running {
@@ -382,6 +388,16 @@ impl App {
             None => bench.show_empty(),
         }
         bench.process_requests();
+
+        // Scheduled workflows run inside the app while it is open.
+        headless::write_pid();
+        let b = bench.clone();
+        glib::timeout_add_seconds_local(60, move || {
+            b.run_due_workflows();
+            glib::ControlFlow::Continue
+        });
+        let b = bench.clone();
+        glib::timeout_add_local_once(Duration::from_secs(5), move || b.run_due_workflows());
         bench
     }
 
@@ -417,12 +433,24 @@ impl App {
         let b = self.clone();
         self.picker.entry.connect_activate(move |_| b.picker_accept());
         let b = self.clone();
+        self.picker.entry.connect_changed(move |_| {
+            let pid = match &*b.picker.mode.borrow() {
+                PickerMode::Workflows(pid) => pid.clone(),
+                _ => return,
+            };
+            b.fill_workflows(&pid);
+        });
+        let b = self.clone();
         self.picker.list.connect_row_activated(move |_, _| b.picker_accept());
         let picker_keys = gtk::EventControllerKey::new();
         picker_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let b = self.clone();
-        picker_keys.connect_key_pressed(move |_, key, _, _| {
+        picker_keys.connect_key_pressed(move |_, key, _, mods| {
             let list = &b.picker.list;
+            if mods.contains(gdk::ModifierType::CONTROL_MASK) && key.to_lower() == gdk::Key::e {
+                b.edit_picked_workflow();
+                return glib::Propagation::Stop;
+            }
             let step = match key {
                 gdk::Key::Escape => {
                     b.close_picker();
@@ -651,8 +679,24 @@ impl App {
             n => format!("{n} tasks"),
         };
         let brief = if notes::brief(&p).is_some() { "brief written" } else { "no brief yet" };
+        let flows = workflow::list(&p);
+        let mut flow_text = String::new();
+        if !flows.is_empty() {
+            flow_text.push_str("\n\nworkflows\n");
+            for wf in &flows {
+                let when = match (&wf.schedule, &wf.schedule_text) {
+                    (Some(_), Some(text)) => format!("  ·  {text}"),
+                    (None, Some(text)) => format!("  ·  can't read schedule \"{text}\""),
+                    _ => String::new(),
+                };
+                flow_text.push_str(&format!("{}{when}\n", wf.name));
+            }
+            if flows.iter().any(|w| w.schedule.is_some() && !w.global) && !headless::timer_installed() {
+                flow_text.push_str("\nscheduled runs happen while codebench is open.\nrun  codebench schedule on  to also run them while it is closed\n");
+            }
+        }
         self.empty.set_text(&format!(
-            "{}\n{}\n\n{tasks}   ·   {brief}\nnotes in {}\n\n^⇧N  new task      ^⇧E  edit notes",
+            "{}\n{}\n\n{tasks}   ·   {brief}\nnotes in {}{flow_text}\n\n^⇧N  new task      ^⇧P  workflows      ^⇧E  edit notes",
             p.name,
             tilde(&p.path),
             tilde(&p.notes_dir()),
@@ -817,6 +861,21 @@ impl App {
         term.connect_child_exited(move |_, _| {
             if let Some(r) = b.running.borrow().get(&id) {
                 r.pid.set(None);
+            }
+            // A workflow editor closes itself and returns to the project.
+            if id.starts_with("edit:") {
+                if let Some(r) = b.running.borrow_mut().remove(&id) {
+                    b.stack.remove(&r.term);
+                }
+                b.status.borrow_mut().remove(&id);
+                if b.current_key.borrow().as_deref() == Some(id.as_str()) {
+                    let pid = b.current_project.borrow().clone();
+                    if let Some(pid) = pid {
+                        b.select(&Row::Project(pid.clone()));
+                        b.show_project(&pid);
+                    }
+                }
+                return;
             }
             b.set_status(&id, Status::Exited);
         });
@@ -1041,6 +1100,7 @@ impl App {
                 launched: false,
                 prompt: Some(notes::handoff_resume(&path)),
                 archived: false,
+                workflow: None,
             };
             project.sessions.insert(idx + 1, next);
             state.save();
@@ -1050,6 +1110,125 @@ impl App {
         self.select(&Row::Session(new_id));
         self.flash(&format!("handed off. note saved to {}", tilde(&path)));
         true
+    }
+
+    // ── workflows ──────────────────────────────────────────────────────────
+
+    fn open_workflows(self: &Rc<Self>) {
+        let Some(pid) = self.current_project.borrow().clone() else {
+            self.flash("select a project first");
+            return;
+        };
+        self.picker.fill("workflows   enter run · ^E edit · type to filter or name a new one", Some(("filter, or a name for a new workflow", "")), &[]);
+        *self.picker.mode.borrow_mut() = PickerMode::Workflows(pid.clone());
+        self.fill_workflows(&pid);
+        self.picker.show();
+    }
+
+    fn fill_workflows(&self, pid: &str) {
+        let Some(project) = self.state.borrow().project(pid).cloned() else { return };
+        let filter = self.picker.entry.text().trim().to_lowercase();
+        let mut rows: Vec<Option<Workflow>> = workflow::list(&project)
+            .into_iter()
+            .filter(|w| filter.is_empty() || w.name.to_lowercase().contains(&filter))
+            .map(Some)
+            .collect();
+        rows.push(None);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                Some(wf) => {
+                    let when = match (&wf.schedule, &wf.schedule_text) {
+                        (Some(_), Some(text)) => text.clone(),
+                        (None, Some(_)) => "bad schedule".into(),
+                        _ => String::new(),
+                    };
+                    let scope = if wf.global { " (global)" } else { "" };
+                    format!("{:<26}{:<9}{when}{scope}", wf.name, wf.agent)
+                }
+                None if filter.is_empty() => "+ new workflow".into(),
+                None => format!("+ new workflow \"{filter}\""),
+            })
+            .collect();
+        self.picker.set_options(&labels);
+        *self.picker.workflows.borrow_mut() = rows;
+    }
+
+    fn edit_picked_workflow(self: &Rc<Self>) {
+        let pid = match &*self.picker.mode.borrow() {
+            PickerMode::Workflows(pid) => pid.clone(),
+            _ => return,
+        };
+        let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+        let Some(Some(wf)) = self.picker.workflows.borrow().get(idx).cloned() else { return };
+        let Some(project) = self.state.borrow().project(&pid).cloned() else { return };
+        *self.picker.mode.borrow_mut() = PickerMode::Closed;
+        self.picker.root.set_visible(false);
+        self.edit_file(&project, &wf.path);
+    }
+
+    /// Opens a file in the editor in its own pane; the pane closes when the
+    /// editor exits.
+    fn edit_file(self: &Rc<Self>, project: &store::Project, path: &Path) {
+        let key = format!("edit:{}", path.display());
+        *self.current_project.borrow_mut() = Some(project.id.clone());
+        *self.current_key.borrow_mut() = Some(key.clone());
+        if !self.status_of(&key).running() {
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
+            let file = path.to_string_lossy().replace('\'', "'\\''");
+            let argv = vec!["sh".to_string(), "-c".to_string(), format!("exec {editor} '{file}'")];
+            let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| project.path.clone());
+            self.spawn(&key, "editor", &argv, &dir, &[]);
+        }
+        self.focus_terminal(&key);
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>{}</b></span>  editing {}",
+            self.theme.borrow().accent,
+            esc(&project.name),
+            esc(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        ));
+        self.flash("save and quit the editor to return. workflows run with ^⇧P");
+    }
+
+    /// Starts a run of the workflow as a new task. Earlier runs of the same
+    /// workflow are archived so only the latest shows.
+    fn run_workflow(self: &Rc<Self>, pid: &str, wf: &Workflow, focus: bool) {
+        if agents::get(&wf.agent).is_none() {
+            self.flash(&format!("{}: unknown agent \"{}\"", wf.name, wf.agent));
+            return;
+        }
+        let now = store::now();
+        let id = uuid::Uuid::new_v4().to_string();
+        self.state.borrow_mut().add_run(
+            pid,
+            Session {
+                id: id.clone(),
+                agent: wf.agent.clone(),
+                title: format!("{} · {}", wf.name, workflow::stamp(now)),
+                created: now,
+                launched: false,
+                prompt: Some(wf.prompt.clone()),
+                archived: false,
+                workflow: Some(wf.path.clone()),
+            },
+        );
+        if focus {
+            self.rebuild_sidebar();
+            self.select(&Row::Session(id));
+        } else {
+            self.launch(&id, None);
+            self.rebuild_sidebar();
+        }
+    }
+
+    fn run_due_workflows(self: &Rc<Self>) {
+        let now = store::now();
+        let projects = self.state.borrow().projects.clone();
+        for (pid, wf) in workflow::due(&projects, now) {
+            workflow::mark_ran(&wf, now);
+            self.run_workflow(&pid, &wf, false);
+            self.flash(&format!("scheduled workflow started: {}", wf.name));
+        }
     }
 
     // ── messages between tasks ─────────────────────────────────────────────
@@ -1126,6 +1305,7 @@ impl App {
                 launched: false,
                 prompt: Some(format!("(Started by Codebench task {starter}.) {prompt}")),
                 archived: false,
+                workflow: None,
             });
             state.save();
         }
@@ -1151,6 +1331,7 @@ impl App {
         if ctrl && shift && !alt {
             match key {
                 gdk::Key::n => self.open_new_task(),
+                gdk::Key::p => self.open_workflows(),
                 gdk::Key::e => self.open_notes(),
                 gdk::Key::h => self.start_handoff(),
                 gdk::Key::o => self.add_project_dialog(),
@@ -1387,6 +1568,21 @@ impl App {
         match mode {
             PickerMode::Closed => {}
             PickerMode::Help => self.close_picker(),
+            PickerMode::Workflows(pid) => {
+                let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+                let picked = self.picker.workflows.borrow().get(idx).cloned();
+                self.picker.root.set_visible(false);
+                match picked {
+                    Some(Some(wf)) => self.run_workflow(&pid, &wf, true),
+                    Some(None) => {
+                        let Some(project) = self.state.borrow().project(&pid).cloned() else { return };
+                        let name = if text.is_empty() { "new workflow" } else { &text };
+                        let path = workflow::create(&project, name);
+                        self.edit_file(&project, &path);
+                    }
+                    None => self.close_picker(),
+                }
+            }
             PickerMode::Rename(sid) => {
                 if !text.is_empty() {
                     if let Some(s) = self.state.borrow_mut().session_mut(&sid) {
@@ -1419,6 +1615,7 @@ impl App {
                         launched: false,
                         prompt: None,
                         archived: false,
+                        workflow: None,
                     });
                     state.save();
                 }
@@ -1452,6 +1649,7 @@ impl Picker {
             list,
             mode: RefCell::new(PickerMode::Closed),
             items: RefCell::default(),
+            workflows: RefCell::default(),
         }
     }
 
@@ -1463,6 +1661,11 @@ impl Picker {
             self.entry.set_placeholder_text(Some(placeholder));
             self.entry.set_text(text);
         }
+        self.set_options(options);
+    }
+
+    /// Replaces the list rows without touching the entry.
+    fn set_options(&self, options: &[String]) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }

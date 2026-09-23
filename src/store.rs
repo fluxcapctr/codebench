@@ -21,6 +21,9 @@ pub struct Session {
     /// Handed off to a newer task; hidden from the sidebar unless shown.
     #[serde(default)]
     pub archived: bool,
+    /// The workflow file this task is a run of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -141,6 +144,21 @@ impl State {
         self.projects
             .iter_mut()
             .find_map(|p| p.sessions.iter_mut().find(|s| s.id == sid))
+    }
+
+    /// Adds a run of `workflow` to a project, archiving its earlier runs so
+    /// only the latest shows.
+    pub fn add_run(&mut self, pid: &str, session: Session) {
+        let Some(project) = self.project_mut(pid) else { return };
+        let same = |p: &Option<PathBuf>| p.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+        let this = same(&session.workflow);
+        for s in project.sessions.iter_mut() {
+            if this.is_some() && same(&s.workflow) == this {
+                s.archived = true;
+            }
+        }
+        project.sessions.push(session);
+        self.save();
     }
 
     /// Adds a project for `path`, or returns the existing one's id.

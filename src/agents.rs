@@ -212,6 +212,38 @@ fn codex_session(session: &Session) -> Option<String> {
     })
 }
 
+/// A one-shot, non-interactive run of `prompt` that still records a
+/// conversation the task can resume later. None for agents without one.
+pub fn headless_argv(session: &Session, project: &Project, prompt: &str) -> Option<Vec<String>> {
+    let s = |v: &str| v.to_string();
+    let context = notes::agent_context(project);
+    match session.agent.as_str() {
+        "claude" => Some(vec![
+            s("claude"),
+            s("-p"),
+            s("--session-id"),
+            session.id.clone(),
+            s("--add-dir"),
+            project.notes_dir().to_string_lossy().into_owned(),
+            s("--append-system-prompt"),
+            context,
+            s("--"),
+            prompt.to_string(),
+        ]),
+        "codex" => Some(vec![
+            s("codex"),
+            s("-c"),
+            format!(
+                "developer_instructions={}",
+                serde_json::Value::String(format!("{context}\n\n{}", codex_marker(&session.id)))
+            ),
+            s("exec"),
+            prompt.to_string(),
+        ]),
+        _ => None,
+    }
+}
+
 /// `{ KEY = "value", ... }`: a TOML inline table for `codex -c`.
 fn toml_inline_table(map: &serde_json::Map<String, serde_json::Value>) -> String {
     let pairs: Vec<String> = map.iter().map(|(k, v)| format!("{k} = {v}")).collect();

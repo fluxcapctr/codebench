@@ -24,6 +24,7 @@ codebench ~/code/some-project   # add a project and open it
 | Key | Action |
 | --- | --- |
 | `Ctrl+Shift+N` | New task in the current project (pick the agent) |
+| `Ctrl+Shift+P` | Workflows: run one, edit it (`Ctrl+E`), or type a name to create one |
 | `Ctrl+Shift+E` | Edit the project's notes in `$EDITOR` |
 | `Ctrl+Shift+H` | Hand off: the agent writes a note, the task continues in a fresh session |
 | `Ctrl+Shift+O` | Add a project folder |
@@ -54,6 +55,37 @@ Each task is its own conversation. Instead of one long chat per project:
 Notes are plain markdown. By default they live in
 `~/.local/share/codebench/notes/`; link them into an Obsidian vault with
 `Ctrl+Shift+L` and the brief and handoffs come along.
+
+## Workflows
+
+A workflow is a saved prompt: a markdown file in the project's
+`notes/workflows/` folder (or `~/.config/codebench/workflows/` for ones every
+project can use).
+
+```markdown
+---
+agent: claude
+schedule: weekdays 09:00
+---
+Check for outdated dependencies and summarize what would change.
+```
+
+Each run is a new task named after the workflow and time; earlier runs of the
+same workflow are archived. Schedules can be `hourly`, `every 6h`,
+`daily 18:30`, `weekdays 09:00`, `weekends 10:00` or `mon,thu 08:00`. A new
+schedule waits for its next time instead of firing at once.
+
+Scheduled workflows run while Codebench is open. To also run them while it is
+closed:
+
+```sh
+codebench schedule on    # systemd user timer, checks every 15 minutes
+codebench schedule off
+```
+
+Background runs use `claude -p` or `codex exec`, save the answer to
+`notes/runs/`, send a notification, and show up as a task you can open and
+continue.
 
 ## Agents talking to each other
 
@@ -91,5 +123,6 @@ subscriptions apply.
 - `~/.local/share/codebench/notes/`: default notes folders
 - `~/.cache/codebench/requests/`: messages and new-task requests from agents
 - `~/.cache/codebench/tasks.json`: live task status, read by the MCP server
+- `~/.config/codebench/schedule.json`: when each scheduled workflow last ran
 - Theme: `~/.local/state/omarchy/current/theme/` (`colors.toml`, `ghostty.conf`)
 - Font: `~/.config/ghostty/config`
