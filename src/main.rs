@@ -1,5 +1,6 @@
 mod agents;
 mod bus;
+mod git;
 mod headless;
 mod mcp;
 mod notes;

@@ -48,6 +48,7 @@ fn run(pid: &str, wf: &Workflow, now: u64) {
         prompt: None,
         archived: false,
         workflow: Some(wf.path.clone()),
+        worktree: None,
     };
     let Some(project) = State::load().project(pid).cloned() else { return };
     let Some(argv) = agents::headless_argv(&session, &project, &wf.prompt) else {
@@ -59,7 +60,7 @@ fn run(pid: &str, wf: &Workflow, now: u64) {
 
     let output = Command::new(&argv[0])
         .args(&argv[1..])
-        .current_dir(&project.path)
+        .current_dir(session.dir(&project))
         .stdin(std::process::Stdio::null())
         .output();
     let (ok, text) = match output {

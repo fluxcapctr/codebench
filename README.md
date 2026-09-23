@@ -26,6 +26,9 @@ codebench ~/code/some-project   # add a project and open it
 | `Ctrl+Shift+N` | New task in the current project (pick the agent) |
 | `Ctrl+Shift+P` | Workflows: run one, edit it (`Ctrl+E`), or type a name to create one |
 | `Ctrl+Shift+E` | Edit the project's notes in `$EDITOR` |
+| `Ctrl+Shift+G` | Git (lazygit) for the task's folder or the project; `q` returns |
+| `Ctrl+Shift+M` | Merge a worktree task back (press twice) |
+| `Tab` | In the new task box: give the task its own git worktree |
 | `Ctrl+Shift+H` | Hand off: the agent writes a note, the task continues in a fresh session |
 | `Ctrl+Shift+O` | Add a project folder |
 | `Ctrl+Shift+L` | Link the project's notes to a folder, such as one in your Obsidian vault |
@@ -55,6 +58,20 @@ Each task is its own conversation. Instead of one long chat per project:
 Notes are plain markdown. By default they live in
 `~/.local/share/codebench/notes/`; link them into an Obsidian vault with
 `Ctrl+Shift+L` and the brief and handoffs come along.
+
+## Git and worktrees
+
+Each git project has a `± git` row showing its branch and uncommitted file
+count. `Ctrl+Shift+G` opens lazygit for whatever you are looking at, for
+diffs, commits and merge conflicts.
+
+For work that should not collide with other agents, press `Tab` in the new
+task box to give the task its **own worktree**: a separate checkout on a new
+`cb/<task>` branch, kept under `~/.local/share/codebench/worktrees/`. The
+sidebar marks it `⑂` with how many files it has changed. When it is done,
+`Ctrl+Shift+M` commits its work and merges the branch into the project;
+conflicts open in lazygit. Deleting the task removes its worktree and branch.
+A handoff keeps working in the same worktree.
 
 ## Workflows
 

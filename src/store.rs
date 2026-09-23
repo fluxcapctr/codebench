@@ -24,6 +24,24 @@ pub struct Session {
     /// The workflow file this task is a run of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<PathBuf>,
+    /// Set when the task works in its own git worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<Worktree>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: String,
+    /// The branch it was made from and merges back into.
+    pub base: String,
+}
+
+impl Session {
+    /// Where the task's agent runs.
+    pub fn dir(&self, project: &Project) -> PathBuf {
+        self.worktree.as_ref().map_or_else(|| project.path.clone(), |w| w.path.clone())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

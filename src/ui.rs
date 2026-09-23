@@ -3,6 +3,7 @@
 
 use crate::agents;
 use crate::bus::{self, Request};
+use crate::git;
 use crate::notes;
 use crate::store::{self, Session, State};
 use crate::theme::{self, Theme};
@@ -19,12 +20,15 @@ use vte::prelude::*;
 
 pub const APP_ID: &str = "co.ericstevens.codebench";
 
-const HINTS: &str = "^⇧N new task   ^⇧P workflows   ^⇧E notes   ^⇧H handoff   ^⇧O add project   alt ↑↓ switch   F1 all keys";
+const HINTS: &str = "^⇧N new task   ^⇧P workflows   ^⇧G git   ^⇧E notes   ^⇧H handoff   alt ↑↓ switch   F1 all keys";
 
 const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+N", "new task in this project"),
     ("Ctrl+Shift+P", "workflows: run, edit (^E) or create saved prompts"),
     ("Ctrl+Shift+E", "edit project notes (brief and handoffs)"),
+    ("Ctrl+Shift+G", "git (lazygit) for this task or project"),
+    ("Ctrl+Shift+M", "merge a worktree task back into its branch (press twice)"),
+    ("Tab", "in the new task box: give the task its own git worktree"),
     ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session"),
     ("Ctrl+Shift+O", "add a project folder"),
     ("Ctrl+Shift+L", "link notes to a folder, e.g. in your Obsidian vault"),
@@ -105,7 +109,23 @@ impl Status {
 enum Row {
     Project(String),
     Notes(String),
+    Git(String),
     Session(String),
+}
+
+/// A fresh worktree and branch for a task, under Codebench's data folder.
+fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<store::Worktree, String> {
+    let short: String = id.chars().take(8).collect();
+    let slug = workflow::slug(title);
+    let branch = format!("cb/{slug}-{short}");
+    let path = store::data_dir().join("worktrees").join(format!("{}-{slug}-{short}", project.name));
+    let base = git::add_worktree(&project.path, &path, &branch)?;
+    Ok(store::Worktree { path, branch, base })
+}
+
+/// Panes that close themselves when their program exits.
+fn transient(key: &str) -> bool {
+    key.starts_with("edit:") || key.starts_with("git:")
 }
 
 fn notes_key(pid: &str) -> String {
@@ -130,6 +150,8 @@ struct Picker {
     items: RefCell<Vec<&'static str>>,
     /// Workflow rows in Workflows mode; None is the "new workflow" row.
     workflows: RefCell<Vec<Option<Workflow>>>,
+    /// NewTask mode: give the task its own worktree (None if not a repo).
+    isolate: Cell<Option<bool>>,
 }
 
 struct Running {
@@ -162,6 +184,11 @@ struct App {
     handoffs: RefCell<HashMap<String, PathBuf>>,
     /// Messages from other tasks waiting for the agent to be free.
     inbox: RefCell<HashMap<String, Vec<String>>>,
+    /// Where to go back to when an editor or git pane closes.
+    return_to: RefCell<Option<Row>>,
+    /// Recent git answers by query, so redraws do not run git every time.
+    git_cache: RefCell<HashMap<String, (Instant, Option<String>)>>,
+    pending_merge: RefCell<Option<(String, Instant)>>,
     current_project: RefCell<Option<String>>,
     /// Terminal key of the row on screen, if it has one.
     current_key: RefCell<Option<String>>,
@@ -357,6 +384,9 @@ impl App {
             context: RefCell::default(),
             handoffs: RefCell::default(),
             inbox: RefCell::default(),
+            return_to: RefCell::default(),
+            git_cache: RefCell::default(),
+            pending_merge: RefCell::default(),
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -412,6 +442,14 @@ impl App {
             match kind {
                 Some(Row::Project(pid)) => b.show_project(&pid),
                 Some(Row::Notes(pid)) => b.show_notes(&pid),
+                Some(Row::Git(pid)) => {
+                    let path = b.state.borrow().project(&pid).map(|p| p.path.clone());
+                    if let Some(path) = path {
+                        *b.current_project.borrow_mut() = Some(pid.clone());
+                        *b.return_to.borrow_mut() = Some(Row::Project(pid));
+                        b.open_git(&path);
+                    }
+                }
                 Some(Row::Session(sid)) => b.show_session(&sid),
                 None => {}
             }
@@ -449,6 +487,13 @@ impl App {
             let list = &b.picker.list;
             if mods.contains(gdk::ModifierType::CONTROL_MASK) && key.to_lower() == gdk::Key::e {
                 b.edit_picked_workflow();
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::Key::Tab && matches!(*b.picker.mode.borrow(), PickerMode::NewTask) {
+                if let Some(on) = b.picker.isolate.get() {
+                    b.picker.isolate.set(Some(!on));
+                    b.new_task_title();
+                }
                 return glib::Propagation::Stop;
             }
             let step = match key {
@@ -548,6 +593,9 @@ impl App {
 
     fn selected_row(&self) -> Option<Row> {
         if let Some(key) = self.current_key.borrow().clone() {
+            if transient(&key) {
+                return self.current_project.borrow().clone().map(Row::Project);
+            }
             return Some(match key.strip_prefix("notes:") {
                 Some(pid) => Row::Notes(pid.to_string()),
                 None => Row::Session(key),
@@ -587,6 +635,19 @@ impl App {
             )));
             rows.push(Row::Notes(p.id.clone()));
 
+            if let Some(branch) = self.git_branch_of(&p.path) {
+                let changed = match self.git_changes(&p.path) {
+                    Some(0) | None => String::new(),
+                    Some(n) => format!("  <span foreground='{}'>+{n}</span>", theme.yellow),
+                };
+                self.sidebar.append(&row_with(&format!(
+                    "  <span foreground='{m}'>± git  {}</span>{changed}",
+                    esc(&branch),
+                    m = theme.muted
+                )));
+                rows.push(Row::Git(p.id.clone()));
+            }
+
             for s in p.sessions.iter().filter(|s| show_archived || !s.archived) {
                 let (glyph, color, word) = self.status_of(&s.id).look(&theme);
                 let word = if word.is_empty() {
@@ -615,6 +676,16 @@ impl App {
                     format!("<span foreground='{}'>{} ↳</span>", theme.muted, esc(&s.title))
                 } else {
                     esc(&s.title)
+                };
+                let title = match &s.worktree {
+                    Some(w) => {
+                        let dirty = self.git_changes(&w.path).unwrap_or(0);
+                        let committed = self.git_ahead(&p.path, w).1;
+                        let n = dirty + committed;
+                        let count = if n > 0 { format!("{n}") } else { String::new() };
+                        format!("{title} <span foreground='{}'>⑂{count}</span>", theme.accent)
+                    }
+                    None => title,
                 };
                 self.sidebar.append(&row_with(&format!(
                     "  <span foreground='{color}'>{glyph}</span> <span foreground='{}'>{:<8}</span>{title}{tokens}{word}",
@@ -804,10 +875,28 @@ impl App {
         }
         self.header_left.set_markup(&left);
 
+        let worktree = match &row {
+            Some(Row::Session(sid)) => state.session(sid).and_then(|(_, s)| s.worktree.clone()),
+            _ => None,
+        };
         let right = match (&row, project) {
             (Some(Row::Notes(_)), Some(p)) => tilde(&p.notes_dir()),
+            (_, Some(p)) if worktree.is_some() => {
+                let w = worktree.unwrap();
+                let (commits, files) = self.git_ahead(&p.path, &w);
+                let dirty = self.git_changes(&w.path).unwrap_or(0);
+                format!(
+                    "⑂ {} → {}   {commits} commits, {files} files{}",
+                    w.branch,
+                    w.base,
+                    if dirty > 0 { format!(", {dirty} uncommitted") } else { String::new() }
+                )
+            }
             (_, Some(p)) => match git_branch(&p.path) {
-                Some(branch) => format!("{}   {branch}", tilde(&p.path)),
+                Some(branch) => match self.git_changes(&p.path) {
+                    Some(n) if n > 0 => format!("{}   {branch}  +{n}", tilde(&p.path)),
+                    _ => format!("{}   {branch}", tilde(&p.path)),
+                },
                 None => tilde(&p.path),
             },
             _ => String::new(),
@@ -862,18 +951,16 @@ impl App {
             if let Some(r) = b.running.borrow().get(&id) {
                 r.pid.set(None);
             }
-            // A workflow editor closes itself and returns to the project.
-            if id.starts_with("edit:") {
+            // Editor and git panes close themselves and return to where
+            // you were.
+            if transient(&id) {
                 if let Some(r) = b.running.borrow_mut().remove(&id) {
                     b.stack.remove(&r.term);
                 }
                 b.status.borrow_mut().remove(&id);
+                b.git_cache.borrow_mut().clear();
                 if b.current_key.borrow().as_deref() == Some(id.as_str()) {
-                    let pid = b.current_project.borrow().clone();
-                    if let Some(pid) = pid {
-                        b.select(&Row::Project(pid.clone()));
-                        b.show_project(&pid);
-                    }
+                    b.go_back();
                 }
                 return;
             }
@@ -969,7 +1056,12 @@ impl App {
             format!("CODEBENCH_NOTES={}", project.notes_dir().display()),
         ];
         let argv = agents::argv(&session, &project, prompt);
-        self.spawn(sid, &session.agent, &argv, &project.path, &env);
+        let dir = session.dir(&project);
+        if !dir.is_dir() {
+            self.flash(&format!("the task's folder is gone: {}", tilde(&dir)));
+            return;
+        }
+        self.spawn(sid, &session.agent, &argv, &dir, &env);
 
         if let Some(s) = self.state.borrow_mut().session_mut(sid) {
             s.launched = true;
@@ -1011,7 +1103,14 @@ impl App {
         if status.free() {
             self.deliver_inbox(key);
         }
+        if status == Status::Done || status == Status::Idle {
+            // The agent may have changed files; let git counts refresh.
+            self.git_cache.borrow_mut().clear();
+        }
         self.rebuild_sidebar();
+        if self.current_key.borrow().as_deref() == Some(key) {
+            self.update_header();
+        }
     }
 
     fn notify(&self, sid: &str, status: Status) {
@@ -1101,6 +1200,7 @@ impl App {
                 prompt: Some(notes::handoff_resume(&path)),
                 archived: false,
                 workflow: None,
+                worktree: old.worktree.clone(),
             };
             project.sessions.insert(idx + 1, next);
             state.save();
@@ -1110,6 +1210,150 @@ impl App {
         self.select(&Row::Session(new_id));
         self.flash(&format!("handed off. note saved to {}", tilde(&path)));
         true
+    }
+
+    // ── git ────────────────────────────────────────────────────────────────
+
+    /// Runs a git query at most every few seconds per key.
+    fn git_cached(&self, key: String, query: impl FnOnce() -> Option<String>) -> Option<String> {
+        if let Some((at, value)) = self.git_cache.borrow().get(&key)
+            && at.elapsed() < Duration::from_secs(3)
+        {
+            return value.clone();
+        }
+        let value = query();
+        self.git_cache.borrow_mut().insert(key, (Instant::now(), value.clone()));
+        value
+    }
+
+    fn git_changes(&self, dir: &Path) -> Option<usize> {
+        self.git_cached(format!("changes:{}", dir.display()), || git::changed_files(dir).map(|n| n.to_string()))
+            .and_then(|n| n.parse().ok())
+    }
+
+    fn git_branch_of(&self, dir: &Path) -> Option<String> {
+        self.git_cached(format!("branch:{}", dir.display()), || {
+            if git::is_repo(dir) { Some(git::branch(dir).unwrap_or_default()) } else { None }
+        })
+    }
+
+    /// (commits, files) a worktree branch is ahead of its base.
+    fn git_ahead(&self, repo: &Path, w: &store::Worktree) -> (usize, usize) {
+        self.git_cached(format!("ahead:{}:{}", w.base, w.branch), || {
+            git::ahead(repo, &w.base, &w.branch).map(|(c, f)| format!("{c} {f}"))
+        })
+        .and_then(|v| {
+            let (c, f) = v.split_once(' ')?;
+            Some((c.parse().ok()?, f.parse().ok()?))
+        })
+        .unwrap_or((0, 0))
+    }
+
+    /// The directory the selected task works in, or the project's.
+    fn current_dir(&self) -> Option<PathBuf> {
+        let state = self.state.borrow();
+        if let Some(Row::Session(sid)) = self.selected_row()
+            && let Some((p, s)) = state.session(&sid)
+        {
+            return Some(s.dir(p));
+        }
+        let pid = self.current_project.borrow().clone()?;
+        state.project(&pid).map(|p| p.path.clone())
+    }
+
+    /// lazygit in its own pane; quitting it returns to where you were.
+    fn open_git(self: &Rc<Self>, dir: &Path) {
+        let key = format!("git:{}", dir.display());
+        *self.current_key.borrow_mut() = Some(key.clone());
+        if !self.status_of(&key).running() {
+            let argv: Vec<String> = if agents::on_path("lazygit") {
+                vec!["lazygit".into()]
+            } else {
+                vec!["sh".into(), "-c".into(), "git status; exec \"${SHELL:-sh}\"".into()]
+            };
+            self.spawn(&key, "git", &argv, dir, &[]);
+        }
+        self.focus_terminal(&key);
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>git</b></span>  {}",
+            self.theme.borrow().accent,
+            esc(&tilde(dir))
+        ));
+        self.header_right.set_text("q to close");
+    }
+
+    /// Back to the row you were on before an editor or git pane opened.
+    fn go_back(self: &Rc<Self>) {
+        let target = self.return_to.borrow_mut().take();
+        let pid = self.current_project.borrow().clone();
+        *self.current_key.borrow_mut() = None;
+        match target.or(pid.map(Row::Project)) {
+            Some(Row::Session(sid)) => {
+                self.select(&Row::Session(sid.clone()));
+                self.show_session(&sid);
+            }
+            Some(Row::Notes(pid)) => {
+                self.select(&Row::Notes(pid.clone()));
+                self.show_notes(&pid);
+            }
+            Some(Row::Project(pid) | Row::Git(pid)) => {
+                self.select(&Row::Project(pid.clone()));
+                self.show_project(&pid);
+            }
+            None => self.show_empty(),
+        }
+        self.rebuild_sidebar();
+    }
+
+    /// Commits the worktree task's changes and merges its branch into the
+    /// project. Press twice.
+    fn merge_current(self: &Rc<Self>) {
+        let Some(Row::Session(sid)) = self.selected_row() else {
+            self.flash("select a worktree task to merge");
+            return;
+        };
+        let Some((project, session)) = self.state.borrow().session(&sid).map(|(p, s)| (p.clone(), s.clone())) else {
+            return;
+        };
+        let Some(w) = session.worktree.clone() else {
+            self.flash("this task works in the project folder directly; there is nothing to merge");
+            return;
+        };
+        let armed = self
+            .pending_merge
+            .borrow()
+            .as_ref()
+            .is_some_and(|(id, at)| *id == sid && at.elapsed() < Duration::from_secs(3));
+        if !armed {
+            *self.pending_merge.borrow_mut() = Some((sid.clone(), Instant::now()));
+            let into = git::branch(&project.path).unwrap_or_else(|| "?".into());
+            let warn = if into != w.base { format!(" (it started from {}!)", w.base) } else { String::new() };
+            self.flash(&format!("press ^⇧M again to commit this task's work and merge {} into {into}{warn}", w.branch));
+            return;
+        }
+        *self.pending_merge.borrow_mut() = None;
+        if self.status_of(&sid) == Status::Working {
+            self.flash("the agent is still working. merge when it is done");
+            return;
+        }
+        if let Err(e) = git::commit_all(&w.path, &format!("{} (codebench task)", session.title)) {
+            self.flash(&format!("could not commit the task's changes: {e}"));
+            return;
+        }
+        let message = format!("Merge codebench task: {}", session.title);
+        self.git_cache.borrow_mut().clear();
+        match git::merge(&project.path, &w.branch, &message) {
+            Ok(git::Merge::Merged) => self.flash("merged. ^⇧D removes the task and its worktree when you are done with it"),
+            Ok(git::Merge::UpToDate) => self.flash("nothing new to merge"),
+            Ok(git::Merge::Conflicts) => {
+                *self.return_to.borrow_mut() = Some(Row::Session(sid));
+                self.open_git(&project.path);
+                self.flash("merge conflicts: resolve them here in lazygit, or ask an agent in the project to fix them");
+            }
+            Err(e) => self.flash(&format!("merge refused: {}", e.lines().next().unwrap_or(&e))),
+        }
+        self.rebuild_sidebar();
+        self.update_header();
     }
 
     // ── workflows ──────────────────────────────────────────────────────────
@@ -1171,6 +1415,7 @@ impl App {
     /// editor exits.
     fn edit_file(self: &Rc<Self>, project: &store::Project, path: &Path) {
         let key = format!("edit:{}", path.display());
+        *self.return_to.borrow_mut() = self.selected_row();
         *self.current_project.borrow_mut() = Some(project.id.clone());
         *self.current_key.borrow_mut() = Some(key.clone());
         if !self.status_of(&key).running() {
@@ -1210,6 +1455,7 @@ impl App {
                 prompt: Some(wf.prompt.clone()),
                 archived: false,
                 workflow: Some(wf.path.clone()),
+                worktree: None,
             },
         );
         if focus {
@@ -1306,6 +1552,7 @@ impl App {
                 prompt: Some(format!("(Started by Codebench task {starter}.) {prompt}")),
                 archived: false,
                 workflow: None,
+                worktree: None,
             });
             state.save();
         }
@@ -1332,6 +1579,18 @@ impl App {
             match key {
                 gdk::Key::n => self.open_new_task(),
                 gdk::Key::p => self.open_workflows(),
+                gdk::Key::g => {
+                    let dir = self.current_dir();
+                    match dir {
+                        Some(dir) if git::is_repo(&dir) => {
+                            *self.return_to.borrow_mut() = self.selected_row();
+                            self.open_git(&dir);
+                        }
+                        Some(_) => self.flash("this project is not a git repository"),
+                        None => self.flash("select a project first"),
+                    }
+                }
+                gdk::Key::m => self.merge_current(),
                 gdk::Key::e => self.open_notes(),
                 gdk::Key::h => self.start_handoff(),
                 gdk::Key::o => self.add_project_dialog(),
@@ -1458,7 +1717,7 @@ impl App {
         let Some(target) = self.selected_row() else { return };
         let key = match &target {
             Row::Project(id) | Row::Session(id) => id.clone(),
-            Row::Notes(_) => return,
+            Row::Notes(_) | Row::Git(_) => return,
         };
         let armed = self
             .pending_delete
@@ -1467,8 +1726,11 @@ impl App {
             .is_some_and(|(id, at)| *id == key && at.elapsed() < Duration::from_secs(3));
         if !armed {
             *self.pending_delete.borrow_mut() = Some((key, Instant::now()));
+            let has_worktree = matches!(&target, Row::Session(sid)
+                if self.state.borrow().session(sid).is_some_and(|(_, s)| s.worktree.is_some()));
             self.flash(match &target {
                 Row::Project(_) => "press ^⇧D again to remove this project from codebench (files and notes are kept)",
+                _ if has_worktree => "press ^⇧D again to delete this task and its worktree. anything not merged is lost",
                 _ => "press ^⇧D again to delete this task",
             });
             return;
@@ -1483,7 +1745,7 @@ impl App {
                 .project(pid)
                 .map(|p| p.sessions.iter().map(|s| s.id.clone()).chain([notes_key(pid)]).collect())
                 .unwrap_or_default(),
-            Row::Notes(_) => Vec::new(),
+            Row::Notes(_) | Row::Git(_) => Vec::new(),
         };
         for key in &doomed {
             self.stop(key);
@@ -1498,6 +1760,14 @@ impl App {
             Row::Session(sid) => {
                 let pid = state.session(sid).map(|(p, _)| p.id.clone());
                 if let Some(p) = pid.as_deref().and_then(|id| state.project_mut(id)) {
+                    // A handoff shares its worktree with the next task; only
+                    // remove it when no other task uses it.
+                    let wt = p.sessions.iter().find(|s| &s.id == sid).and_then(|s| s.worktree.clone());
+                    if let Some(w) = wt
+                        && !p.sessions.iter().any(|s| &s.id != sid && s.worktree.as_ref().is_some_and(|o| o.path == w.path))
+                    {
+                        git::remove_worktree(&p.path, &w.path, &w.branch);
+                    }
                     p.sessions.retain(|s| &s.id != sid);
                 }
                 pid.map(Row::Project)
@@ -1506,7 +1776,7 @@ impl App {
                 state.projects.retain(|p| &p.id != pid);
                 state.projects.first().map(|p| Row::Project(p.id.clone()))
             }
-            Row::Notes(_) => None,
+            Row::Notes(_) | Row::Git(_) => None,
         };
         state.save();
         drop(state);
@@ -1527,16 +1797,29 @@ impl App {
             self.flash("select a project first, or ^⇧O to add one");
             return;
         };
-        let name = self.state.borrow().project(&pid).map(|p| p.name.clone()).unwrap_or_default();
+        let is_repo = self.state.borrow().project(&pid).is_some_and(|p| git::is_repo(&p.path));
         let agents = agents::installed();
         self.picker.fill(
-            &format!("new task in {name}"),
+            "",
             Some(("task name (optional)", "")),
             &agents.iter().map(|a| format!("{:<9}{}", a.id, a.label)).collect::<Vec<_>>(),
         );
+        self.picker.isolate.set(is_repo.then_some(false));
         *self.picker.items.borrow_mut() = agents.iter().map(|a| a.id).collect();
         *self.picker.mode.borrow_mut() = PickerMode::NewTask;
+        self.new_task_title();
         self.picker.show();
+    }
+
+    fn new_task_title(&self) {
+        let pid = self.current_project.borrow().clone().unwrap_or_default();
+        let name = self.state.borrow().project(&pid).map(|p| p.name.clone()).unwrap_or_default();
+        let isolate = match self.picker.isolate.get() {
+            Some(true) => "   tab: own worktree [on]",
+            Some(false) => "   tab: own worktree [off]",
+            None => "",
+        };
+        self.picker.title.set_text(&format!("new task in {name}{isolate}"));
     }
 
     fn open_rename(self: &Rc<Self>) {
@@ -1598,15 +1881,28 @@ impl App {
                 let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
                 let agent = self.picker.items.borrow().get(idx).copied().unwrap_or("claude");
                 let Some(pid) = self.current_project.borrow().clone() else { return };
+                let Some(project) = self.state.borrow().project(&pid).cloned() else { return };
                 let id = uuid::Uuid::new_v4().to_string();
+                let title = if text.is_empty() {
+                    format!("task {}", project.sessions.len() + 1)
+                } else {
+                    text
+                };
+                let worktree = if self.picker.isolate.get() == Some(true) {
+                    match make_worktree(&project, &id, &title) {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            self.close_picker();
+                            self.flash(&format!("could not create a worktree: {e}"));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 {
                     let mut state = self.state.borrow_mut();
                     let Some(project) = state.project_mut(&pid) else { return };
-                    let title = if text.is_empty() {
-                        format!("task {}", project.sessions.len() + 1)
-                    } else {
-                        text
-                    };
                     project.sessions.push(Session {
                         id: id.clone(),
                         agent: agent.to_string(),
@@ -1616,6 +1912,7 @@ impl App {
                         prompt: None,
                         archived: false,
                         workflow: None,
+                        worktree,
                     });
                     state.save();
                 }
@@ -1650,6 +1947,7 @@ impl Picker {
             mode: RefCell::new(PickerMode::Closed),
             items: RefCell::default(),
             workflows: RefCell::default(),
+            isolate: Cell::new(None),
         }
     }
 

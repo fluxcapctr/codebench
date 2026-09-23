@@ -29,7 +29,7 @@ pub fn get(id: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|a| a.id == id)
 }
 
-fn on_path(program: &str) -> bool {
+pub fn on_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
     std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
