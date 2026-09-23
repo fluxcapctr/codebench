@@ -21,6 +21,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// `git init` with a main branch.
+pub fn init(dir: &Path) -> Result<(), String> {
+    git(dir, &["init", "-q", "-b", "main"]).map(|_| ())
+}
+
 pub fn is_repo(dir: &Path) -> bool {
     git(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|s| s == "true")
 }

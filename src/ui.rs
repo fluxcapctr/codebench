@@ -33,7 +33,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+M", "merge a worktree task back into its branch (press twice)"),
     ("Tab", "in the new task box: give the task its own git worktree"),
     ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session"),
-    ("Ctrl+Shift+O", "add a project folder"),
+    ("Ctrl+Shift+O", "add a project: new (with git), one of your folders, or browse"),
     ("Ctrl+Shift+I", "import past Claude and Codex chats for this project"),
     ("Ctrl+Shift+U", "accounts: see logins, sign in, switch accounts"),
     ("Ctrl+Shift+L", "link notes to a folder, e.g. in your Obsidian vault"),
@@ -121,6 +121,24 @@ enum Row {
     Session(String),
 }
 
+/// Where new projects are created: ~/code if it exists, else home.
+fn projects_root() -> PathBuf {
+    let code = store::home().join("code");
+    if code.is_dir() { code } else { store::home() }
+}
+
+/// A folder name from what was typed: letters, digits, '.', '_' and '-',
+/// with spaces turned into '-'.
+fn project_folder_name(typed: &str) -> String {
+    let name: String = typed
+        .trim()
+        .chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    name.trim_matches(['.', '-']).to_string()
+}
+
 /// A fresh worktree and branch for a task, under Codebench's data folder.
 fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<store::Worktree, String> {
     let short: String = id.chars().take(8).collect();
@@ -148,6 +166,15 @@ enum PickerMode {
     Workflows(String),
     Accounts,
     Import(String),
+    AddProject,
+}
+
+#[derive(Clone)]
+enum AddChoice {
+    /// Create this folder under the projects folder, with git.
+    New(String),
+    Browse,
+    Existing(PathBuf),
 }
 
 struct Picker {
@@ -164,6 +191,8 @@ struct Picker {
     isolate: Cell<Option<bool>>,
     /// Import mode rows.
     past: RefCell<Vec<Past>>,
+    /// AddProject mode rows.
+    add_choices: RefCell<Vec<AddChoice>>,
 }
 
 struct Running {
@@ -557,6 +586,7 @@ impl App {
             match &*b.picker.mode.borrow() {
                 PickerMode::Workflows(pid) => b.fill_workflows(pid),
                 PickerMode::Import(_) => b.fill_import(),
+                PickerMode::AddProject => b.fill_add_project(),
                 _ => {}
             }
         });
@@ -2131,7 +2161,7 @@ impl App {
                 gdk::Key::m => self.merge_current(),
                 gdk::Key::e => self.open_notes(),
                 gdk::Key::h => self.start_handoff(),
-                gdk::Key::o => self.add_project_dialog(),
+                gdk::Key::o => self.open_add_project(),
                 gdk::Key::u => self.open_accounts(),
                 gdk::Key::i => self.open_import(),
                 gdk::Key::l => self.link_notes_dialog(),
@@ -2192,6 +2222,82 @@ impl App {
         let pid = self.state.borrow_mut().add_project(path);
         self.rebuild_sidebar();
         self.select(&Row::Project(pid));
+    }
+
+    fn open_add_project(self: &Rc<Self>) {
+        self.picker.fill(
+            &format!("add project   type a name for a new one in {}", tilde(&projects_root())),
+            Some(("new project name, or filter your folders", "")),
+            &[],
+        );
+        *self.picker.mode.borrow_mut() = PickerMode::AddProject;
+        self.fill_add_project();
+        self.picker.show();
+    }
+
+    /// Rows: a new project named after what was typed, the file dialog, and
+    /// folders in the projects folder that are not projects yet.
+    fn fill_add_project(&self) {
+        let typed = self.picker.entry.text().trim().to_string();
+        let name = project_folder_name(&typed);
+        let root = projects_root();
+        let known: Vec<PathBuf> = self.state.borrow().projects.iter().map(|p| p.path.clone()).collect();
+        let mut folders: Vec<(u64, PathBuf)> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+            .filter(|p| !known.contains(&p.canonicalize().unwrap_or_else(|_| p.clone())))
+            .filter(|p| typed.is_empty() || p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&typed.to_lowercase())))
+            .map(|p| {
+                let modified = std::fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                (modified, p)
+            })
+            .collect();
+        folders.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut choices = Vec::new();
+        let exists = !name.is_empty() && root.join(&name).exists();
+        if !name.is_empty() && !exists {
+            choices.push(AddChoice::New(name.clone()));
+        }
+        choices.extend(folders.into_iter().take(12).map(|(_, p)| AddChoice::Existing(p)));
+        choices.push(AddChoice::Browse);
+
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|c| match c {
+                AddChoice::New(n) => format!("+ new project {n}   (creates {}, with git)", tilde(&root.join(n))),
+                AddChoice::Browse => "open another folder…".to_string(),
+                AddChoice::Existing(p) => {
+                    let git = if git::is_repo(p) { "  git" } else { "" };
+                    format!("  {}{git}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+                }
+            })
+            .collect();
+        self.picker.set_options(&labels);
+        *self.picker.add_choices.borrow_mut() = choices;
+    }
+
+    /// Makes the folder, runs git init, adds it as a project and opens it.
+    fn create_project(self: &Rc<Self>, name: &str) {
+        let dir = projects_root().join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.flash(&format!("could not create {}: {e}", tilde(&dir)));
+            return;
+        }
+        if !git::is_repo(&dir)
+            && let Err(e) = git::init(&dir)
+        {
+            self.flash(&format!("created {}, but git init failed: {e}", tilde(&dir)));
+        }
+        self.open_path(&dir);
+        self.flash("new project. ^⇧E to write its brief, ^⇧N to start a task");
     }
 
     fn add_project_dialog(self: &Rc<Self>) {
@@ -2409,6 +2515,17 @@ impl App {
                 *self.picker.mode.borrow_mut() = PickerMode::Accounts;
                 self.sign_in_picked(false);
             }
+            PickerMode::AddProject => {
+                let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+                let choice = self.picker.add_choices.borrow().get(idx).cloned();
+                self.close_picker();
+                match choice {
+                    Some(AddChoice::New(name)) => self.create_project(&name),
+                    Some(AddChoice::Browse) => self.add_project_dialog(),
+                    Some(AddChoice::Existing(path)) => self.open_path(&path),
+                    None => {}
+                }
+            }
             PickerMode::Import(pid) => {
                 *self.picker.mode.borrow_mut() = PickerMode::Import(pid.clone());
                 self.import_picked(&pid);
@@ -2512,6 +2629,7 @@ impl Picker {
             workflows: RefCell::default(),
             isolate: Cell::new(None),
             past: RefCell::default(),
+            add_choices: RefCell::default(),
         }
     }
 
@@ -2550,5 +2668,18 @@ impl Picker {
         } else if let Some(row) = self.list.row_at_index(0) {
             row.grab_focus();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_names_become_safe_folders() {
+        assert_eq!(project_folder_name("My New App"), "My-New-App");
+        assert_eq!(project_folder_name("../../etc"), "etc");
+        assert_eq!(project_folder_name("  a/b\\c "), "abc");
+        assert_eq!(project_folder_name("..."), "");
     }
 }

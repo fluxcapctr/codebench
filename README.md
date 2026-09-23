@@ -26,8 +26,12 @@ lazygit is used for the git pane.
 
 ## Use
 
+`Ctrl+Shift+O` adds a project. Type a name and pick **+ new project** to
+create `~/code/<name>` with git, pick one of your `~/code` folders that is not
+a project yet, or browse to any folder. From a terminal:
+
 ```sh
-codebench ~/code/some-project   # add a project and open it
+codebench ~/code/some-project   # add a folder as a project and open it
 ```
 
 | Key | Action |
@@ -39,7 +43,7 @@ codebench ~/code/some-project   # add a project and open it
 | `Ctrl+Shift+M` | Merge a worktree task back (press twice) |
 | `Tab` | In the new task box: give the task its own git worktree |
 | `Ctrl+Shift+H` | Hand off: the agent writes a note, the task continues in a fresh session |
-| `Ctrl+Shift+O` | Add a project folder |
+| `Ctrl+Shift+O` | Add a project: new (creates the folder with git), one of your folders, or browse |
 | `Ctrl+Shift+I` | Import past Claude and Codex chats for this project |
 | `Ctrl+Shift+U` | Accounts: logins per agent, sign in, switch account |
 | `Ctrl+Shift+L` | Link the project's notes to a folder, such as one in your Obsidian vault |
