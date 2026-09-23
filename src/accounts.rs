@@ -17,6 +17,63 @@ pub enum Login {
 pub struct Account {
     pub agent: &'static str,
     pub login: Login,
+    pub installed: bool,
+    /// (current, latest) when a newer version is out.
+    pub update: Option<(String, String)>,
+}
+
+/// The mise tool name for each agent, when installed through mise.
+fn mise_tool(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "gemini" => Some("gemini"),
+        "opencode" => Some("opencode"),
+        "grok" => Some("npm:@xai-official/grok"),
+        _ => None,
+    }
+}
+
+fn mise_managed() -> Vec<String> {
+    run("mise", &["ls", "--current", "--json"])
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default()
+}
+
+/// Newer versions of mise-managed tools: tool -> (current, latest).
+fn mise_outdated() -> std::collections::HashMap<String, (String, String)> {
+    run("mise", &["outdated", "--json"])
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.as_object().map(|o| {
+                o.iter()
+                    .filter_map(|(k, t)| Some((k.clone(), (t["current"].as_str()?.to_string(), t["latest"].as_str()?.to_string()))))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Shell command that updates the agent's CLI, if Codebench knows one.
+pub fn update_command(agent: &str) -> Option<String> {
+    if let Some(tool) = mise_tool(agent).filter(|t| mise_managed().iter().any(|m| m == t)) {
+        return Some(format!("mise upgrade '{tool}'"));
+    }
+    match agent {
+        "claude" => Some("claude update".into()),
+        "codex" => Some("codex update".into()),
+        "grok" => Some("grok update".into()),
+        "opencode" => Some("opencode upgrade".into()),
+        "agy" => Some("agy update".into()),
+        _ => None,
+    }
+}
+
+/// Shell command that installs a missing agent's CLI through mise.
+pub fn install_command(agent: &str) -> Option<String> {
+    let tool = mise_tool(agent)?;
+    agents::on_path("mise").then(|| format!("mise use -g '{tool}@latest'"))
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
@@ -88,17 +145,37 @@ pub fn check(agent: &'static str) -> Account {
         },
         _ => Login::Unknown(String::new()),
     };
-    Account { agent, login }
+    Account { agent, login, installed: true, update: None }
 }
 
-/// All installed agents, checked in parallel.
+/// Every known agent: installed ones checked in parallel, with any update
+/// mise knows about; missing ones listed as not installed.
 pub fn check_all() -> Vec<Account> {
-    let handles: Vec<_> = agents::installed()
-        .into_iter()
+    let outdated = std::thread::spawn(mise_outdated);
+    let installed: Vec<&str> = agents::installed().iter().map(|a| a.id).collect();
+    let handles: Vec<_> = agents::AGENTS
+        .iter()
         .filter(|a| a.id != "shell")
-        .map(|a| std::thread::spawn(move || check(a.id)))
+        .map(|a| {
+            let present = installed.contains(&a.id);
+            std::thread::spawn(move || {
+                if present {
+                    check(a.id)
+                } else {
+                    Account { agent: a.id, login: Login::Unknown("not installed".into()), installed: false, update: None }
+                }
+            })
+        })
         .collect();
-    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    let outdated = outdated.join().unwrap_or_default();
+    handles
+        .into_iter()
+        .filter_map(|h| h.join().ok())
+        .map(|mut a| {
+            a.update = mise_tool(a.agent).and_then(|t| outdated.get(t).cloned());
+            a
+        })
+        .collect()
 }
 
 /// Shell command that signs in (or, with `switch`, signs out first).

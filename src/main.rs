@@ -54,10 +54,12 @@ fn main() -> gtk::glib::ExitCode {
         }
         Some("accounts") => {
             for a in accounts::check_all() {
+                let update = a.update.map(|(c, l)| format!("   (update {c} -> {l})")).unwrap_or_default();
                 match a.login {
-                    accounts::Login::In(d) => println!("{:<10}signed in  {d}", a.agent),
-                    accounts::Login::Out => println!("{:<10}signed out", a.agent),
-                    accounts::Login::Unknown(w) => println!("{:<10}unknown    {w}", a.agent),
+                    _ if !a.installed => println!("{:<10}not installed", a.agent),
+                    accounts::Login::In(d) => println!("{:<10}signed in  {d}{update}", a.agent),
+                    accounts::Login::Out => println!("{:<10}signed out{update}", a.agent),
+                    accounts::Login::Unknown(w) => println!("{:<10}unknown    {w}{update}", a.agent),
                 }
             }
             std::process::exit(0);

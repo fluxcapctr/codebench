@@ -555,6 +555,14 @@ impl App {
                         b.refresh_accounts();
                         return glib::Propagation::Stop;
                     }
+                    gdk::Key::u => {
+                        b.run_account_command(accounts::update_command, "update");
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::i => {
+                        b.run_account_command(accounts::install_command, "install");
+                        return glib::Propagation::Stop;
+                    }
                     _ => {}
                 }
             }
@@ -1420,6 +1428,7 @@ impl App {
             .accounts
             .borrow()
             .iter()
+            .filter(|a| a.installed)
             .map(|a| match a.login {
                 Login::In(_) => format!("{} <span foreground='{}'>✓</span>", a.agent, theme.green),
                 Login::Out => format!("{} <span foreground='{}'>✗</span>", a.agent, theme.red),
@@ -1430,7 +1439,11 @@ impl App {
     }
 
     fn open_accounts(self: &Rc<Self>) {
-        self.picker.fill("accounts   enter sign in · s switch account · r refresh · esc close", None, &["checking…".to_string()]);
+        self.picker.fill(
+            "accounts   enter sign in · s switch · u update · i install · r refresh",
+            None,
+            &["checking…".to_string()],
+        );
         *self.picker.mode.borrow_mut() = PickerMode::Accounts;
         self.fill_accounts();
         self.picker.show();
@@ -1442,10 +1455,15 @@ impl App {
             .accounts
             .borrow()
             .iter()
-            .map(|a| match &a.login {
-                Login::In(detail) => format!("{:<10}✓ {detail}", a.agent),
-                Login::Out => format!("{:<10}✗ signed out", a.agent),
-                Login::Unknown(why) => format!("{:<10}? {why}", a.agent),
+            .map(|a| {
+                let login = match &a.login {
+                    _ if !a.installed => "- not installed (i to install)".to_string(),
+                    Login::In(detail) => format!("✓ {detail}"),
+                    Login::Out => "✗ signed out".to_string(),
+                    Login::Unknown(why) => format!("? {why}"),
+                };
+                let update = a.update.as_ref().map(|(cur, new)| format!("   ↑ {cur} → {new}")).unwrap_or_default();
+                format!("{:<10}{login}{update}", a.agent)
             })
             .collect();
         if !rows.is_empty() {
@@ -1458,23 +1476,41 @@ impl App {
         }
     }
 
+    /// Runs an update or install command for the picked agent in a pane.
+    fn run_account_command(self: &Rc<Self>, command: fn(&str) -> Option<String>, what: &str) {
+        let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+        let Some(agent) = self.accounts.borrow().get(idx).map(|a| a.agent) else { return };
+        match command(agent) {
+            Some(cmd) => self.run_in_auth_pane(agent, &format!("{cmd}; echo; echo 'done. press enter to close'; read _"), what),
+            None => self.flash(&format!("codebench does not know how to {what} {agent} here")),
+        }
+    }
+
     /// Runs the picked agent's sign-in (or sign-out and sign-in) in a pane.
     fn sign_in_picked(self: &Rc<Self>, switch: bool) {
         let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
         let Some(agent) = self.accounts.borrow().get(idx).map(|a| a.agent) else { return };
+        if !self.accounts.borrow().get(idx).is_some_and(|a| a.installed) {
+            self.flash(&format!("{agent} is not installed. press i to install it"));
+            return;
+        }
         let Some(cmd) = accounts::login_command(agent, switch) else { return };
+        self.run_in_auth_pane(agent, &cmd, if switch { "switch account" } else { "sign in" });
+    }
+
+    /// A self-closing pane for account and install commands.
+    fn run_in_auth_pane(self: &Rc<Self>, agent: &str, cmd: &str, what: &str) {
         *self.picker.mode.borrow_mut() = PickerMode::Closed;
         self.picker.root.set_visible(false);
         let key = format!("auth:{agent}");
         *self.return_to.borrow_mut() = self.selected_row();
         *self.current_key.borrow_mut() = Some(key.clone());
-        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+        let argv = vec!["sh".to_string(), "-c".to_string(), cmd.to_string()];
         self.spawn(&key, "auth", &argv, &store::home(), &[]);
         self.focus_terminal(&key);
         self.header_left.set_markup(&format!(
-            "<span foreground='{}'><b>{agent}</b></span>  {}",
+            "<span foreground='{}'><b>{agent}</b></span>  {what}",
             self.theme.borrow().accent,
-            if switch { "switch account" } else { "sign in" }
         ));
         self.header_right.set_text("returns when done");
     }
