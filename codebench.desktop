@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Codebench
+Comment=Run coding agents across projects in one terminal-style workspace
+Exec=codebench %f
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;TerminalEmulator;
+StartupWMClass=co.ericstevens.codebench
