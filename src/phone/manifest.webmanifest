@@ -1,0 +1,10 @@
+{
+  "name": "Codebench",
+  "short_name": "codebench",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#05182e",
+  "theme_color": "#05182e",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

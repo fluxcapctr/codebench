@@ -12,9 +12,11 @@ use crate::theme::{self, Theme};
 use crate::progress;
 use crate::usage;
 use crate::limits::{self, Usage};
+use crate::remote::{self, Remote};
 use crate::workflow::{self, Workflow};
 use crate::headless;
 use gtk::{gdk, gio, glib, pango, prelude::*};
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +46,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+D", "delete task or remove project (press twice)"),
     ("Ctrl+Shift+A", "show or hide handed-off tasks"),
     ("Ctrl+Shift+K", "give this project's agents a browser (on or off)"),
+    ("Ctrl+Shift+Y", "phone access: on or off, address, paired phones"),
     ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left"),
     ("Ctrl+Shift+← / →", "focus the left or right side of a split"),
     ("Ctrl+Shift+B", "show or hide the sidebar"),
@@ -150,6 +153,69 @@ fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<stor
     Ok(store::Worktree { path, branch, base })
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct PhoneSettings {
+    enabled: bool,
+    port: u16,
+}
+
+fn phone_settings() -> PhoneSettings {
+    std::fs::read(store::config_dir().join("phone.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(PhoneSettings { enabled: false, port: remote::DEFAULT_PORT })
+}
+
+fn save_phone_settings(s: &PhoneSettings) {
+    if let Ok(json) = serde_json::to_vec_pretty(s) {
+        let _ = std::fs::write(store::config_dir().join("phone.json"), json);
+    }
+}
+
+/// The https address `tailscale serve` gives this machine, if it is set up.
+fn tailnet_address() -> Option<String> {
+    let out = std::process::Command::new("tailscale").args(["serve", "status", "--json"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["Web"].as_object()?.keys().next().map(|host| format!("https://{}", host.trim_end_matches(":443")))
+}
+
+/// Drops blank lines around a screen capture.
+fn trim_screen(html: &str) -> String {
+    let body = html.trim().strip_prefix("<pre>").unwrap_or(html).strip_suffix("</pre>").unwrap_or(html);
+    let body = body.trim_end().trim_start_matches(['\n', '\r']);
+    format!("<pre>{body}\n</pre>")
+}
+
+/// Terminal input for a key the phone sends.
+fn key_bytes(key: &str) -> Option<&'static [u8]> {
+    Some(match key {
+        "enter" => b"\r",
+        "esc" => b"\x1b",
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        "tab" => b"\t",
+        "shift-tab" => b"\x1b[Z",
+        "ctrl-c" => b"\x03",
+        "y" => b"y",
+        "n" => b"n",
+        "1" => b"1",
+        "2" => b"2",
+        "3" => b"3",
+        "4" => b"4",
+        _ => return None,
+    })
+}
+
+/// The phone app's colors and font, from the Omarchy theme.
+fn phone_css(t: &Theme) -> String {
+    format!(
+        ":root {{ --bg: {}; --fg: {}; --accent: {}; --muted: {}; --dark: {}; --light: {}; --selection: {}; --red: {}; --green: {}; --yellow: {}; --font: \"{}\"; }}",
+        t.background, t.foreground, t.accent, t.muted, t.dark_background, t.light_background, t.selection, t.red, t.green, t.yellow, t.font_family
+    )
+}
+
 /// "week (all models)" -> "week", "week (Fable)" -> "Fable week".
 fn short_limit(name: &str) -> String {
     match name.split_once(" (") {
@@ -179,6 +245,9 @@ enum PickerMode {
     Accounts,
     Import(String),
     AddProject,
+    Phone,
+    /// A phone asks to pair: (pairing id).
+    Pair(String),
 }
 
 #[derive(Clone)]
@@ -221,6 +290,9 @@ struct Running {
 fn watches_activity(agent: &str) -> bool {
     matches!(agent, "gemini" | "grok" | "opencode" | "agy")
 }
+
+/// Width a task gets when opened from the phone and not on the desktop.
+const PHONE_COLUMNS: libc::c_long = 64;
 
 /// How long the screen must stay still before a task counts as done.
 const SETTLE: Duration = Duration::from_secs(5);
@@ -265,6 +337,10 @@ struct App {
     /// The task shown on the right of a split.
     pinned: RefCell<Option<String>>,
     board: gtk::Label,
+    /// The phone server, while phone access is on.
+    remote: RefCell<Option<Rc<Remote>>>,
+    /// Terminals with a screen capture for the phone already scheduled.
+    screen_pending: RefCell<std::collections::HashSet<String>>,
     /// Holds off suspend while any agent is working.
     keep_awake: RefCell<Option<std::process::Child>>,
     current_project: RefCell<Option<String>>,
@@ -515,6 +591,8 @@ impl App {
             pinned: RefCell::default(),
             keep_awake: RefCell::default(),
             board,
+            remote: RefCell::default(),
+            screen_pending: RefCell::default(),
             current_project: RefCell::default(),
             current_key: RefCell::default(),
             status_dir,
@@ -547,6 +625,9 @@ impl App {
         }
         bench.process_requests();
         bench.refresh_accounts();
+        if phone_settings().enabled {
+            bench.start_remote();
+        }
 
         // Subscription limits: soon after start, then every ten minutes.
         let b = bench.clone();
@@ -768,6 +849,9 @@ impl App {
             b.reload_pending.set(false);
             *b.theme.borrow_mut() = Theme::load();
             b.css.load_from_string(&b.theme.borrow().css());
+            if let Some(r) = b.remote.borrow().as_ref() {
+                r.publish_theme(phone_css(&b.theme.borrow()));
+            }
             for r in b.running.borrow().values() {
                 b.style_terminal(&r.term);
             }
@@ -894,6 +978,7 @@ impl App {
             .map(|s| (s.id.clone(), self.status_of(&s.id).name()))
             .collect();
         bus::write_snapshot(&snapshot);
+        self.publish_phone_state(&state);
         drop((state, theme, context));
 
         let idx = self.selected_row().and_then(|sel| rows.iter().position(|r| *r == sel));
@@ -1334,6 +1419,10 @@ impl App {
                 }
             });
         }
+        // Feed the screen to a phone that is looking at this task.
+        let b = self.clone();
+        let id = key.to_string();
+        term.connect_contents_changed(move |_| b.schedule_screen(&id));
         term
     }
 
@@ -1347,6 +1436,9 @@ impl App {
             }
             None => {
                 let term = self.new_terminal(key, agent);
+                // A terminal that has never been on screen has no size yet,
+                // and TUIs draw nothing at zero columns.
+                term.set_size(100, 36);
                 self.stack.add_named(&term, Some(key));
                 let r = Rc::new(Running {
                     term,
@@ -1864,6 +1956,249 @@ impl App {
         self.flash(&format!("imported \"{}\". pick more, or esc", past.title));
     }
 
+    // ── phone ──────────────────────────────────────────────────────────────
+
+    fn start_remote(self: &Rc<Self>) {
+        let port = phone_settings().port;
+        let remote = match Remote::start(port) {
+            Ok(r) => Rc::new(r),
+            Err(e) => {
+                self.flash(&format!("phone access could not start: {e}"));
+                return;
+            }
+        };
+        remote.publish_theme(phone_css(&self.theme.borrow()));
+        let commands = remote.commands.clone();
+        *self.remote.borrow_mut() = Some(remote);
+        self.rebuild_sidebar();
+        let b = self.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(cmd) = commands.recv().await {
+                b.handle_phone(cmd);
+            }
+        });
+    }
+
+    fn stop_remote(&self) {
+        // Dropping the handle shuts the server down.
+        self.remote.borrow_mut().take();
+    }
+
+    fn publish_phone_state(&self, state: &State) {
+        let Some(remote) = self.remote.borrow().clone() else { return };
+        let kind = |sid: &str| match self.status_of(sid) {
+            Status::Waiting | Status::Done => "needs",
+            Status::Working => "working",
+            Status::Idle => "idle",
+            Status::Dormant | Status::Exited => "stopped",
+        };
+        let context = self.context.borrow();
+        let projects: Vec<serde_json::Value> = state
+            .projects
+            .iter()
+            .map(|p| {
+                let tasks: Vec<serde_json::Value> = p
+                    .sessions
+                    .iter()
+                    // The phone never gets a plain shell.
+                    .filter(|s| !s.archived && s.agent != "shell")
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id, "title": s.title, "agent": s.agent, "kind": kind(&s.id),
+                            "context": context.get(&s.id).map(|&n| usage::short(n)),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "id": p.id, "name": p.name, "tasks": tasks })
+            })
+            .collect();
+        let usage: Vec<serde_json::Value> = self
+            .usage
+            .borrow()
+            .iter()
+            .map(|u| {
+                let limits: Vec<serde_json::Value> = u
+                    .limits
+                    .iter()
+                    .map(|l| serde_json::json!({ "name": short_limit(&l.name), "percent": l.percent }))
+                    .collect();
+                serde_json::json!({ "agent": u.agent, "limits": limits })
+            })
+            .collect();
+        let agents: Vec<&str> = agents::installed().iter().filter(|a| a.id != "shell").map(|a| a.id).collect();
+        let json = serde_json::json!({ "running": true, "projects": projects, "usage": usage, "agents": agents });
+        remote.publish_state(json.to_string());
+    }
+
+    /// Sends a terminal's screen to the phone at most five times a second.
+    fn schedule_screen(self: &Rc<Self>, key: &str) {
+        let watched = self.remote.borrow().as_ref().is_some_and(|r| r.is_watched(key));
+        if !watched || !self.screen_pending.borrow_mut().insert(key.to_string()) {
+            return;
+        }
+        let b = self.clone();
+        let key = key.to_string();
+        glib::timeout_add_local_once(Duration::from_millis(200), move || {
+            b.screen_pending.borrow_mut().remove(&key);
+            b.send_screen(&key);
+        });
+    }
+
+    fn send_screen(&self, key: &str) {
+        let term = self.running.borrow().get(key).map(|r| r.term.clone());
+        let (Some(term), Some(remote)) = (term, self.remote.borrow().clone()) else { return };
+        // The screen plus two screens of history, by row number, so it works
+        // for tasks that were never shown on the desktop too.
+        // Row numbers count the whole scrollback. The scroll position is not
+        // kept for a terminal never shown, so anchor on the cursor, which
+        // is always on the live screen.
+        let rows = term.row_count();
+        let cols = term.column_count();
+        let (_, cursor_row) = term.cursor_position();
+        let end = (cursor_row + rows).max(rows);
+        let start = (end - rows * 3).max(0);
+        let (html, _) = term.text_range_format(vte::Format::Html, start, 0, end - 1, cols);
+        let html = trim_screen(&html.map(|h| h.to_string()).unwrap_or_default());
+        remote.publish_screen(key, html);
+    }
+
+    /// Only agent tasks take input from the phone: never a shell, editor,
+    /// git or sign-in pane.
+    fn phone_task(&self, sid: &str) -> Option<Session> {
+        self.state.borrow().session(sid).map(|(_, s)| s.clone()).filter(|s| s.agent != "shell")
+    }
+
+    fn handle_phone(self: &Rc<Self>, cmd: remote::Command) {
+        match cmd {
+            remote::Command::PairRequest { id, code, name } => {
+                self.picker.fill(
+                    &format!("pair phone \"{name}\"?   it shows {} {}", &code[..3], &code[3..]),
+                    None,
+                    &["enter: approve   ·   esc: deny".to_string()],
+                );
+                *self.picker.mode.borrow_mut() = PickerMode::Pair(id);
+                self.picker.show();
+                self.window.present();
+                let _ = std::process::Command::new("notify-send")
+                    .args(["-a", "Codebench", "Phone wants to pair", &format!("{name} shows {code}. Approve it in Codebench.")])
+                    .spawn();
+            }
+            remote::Command::Send { task, text } => {
+                if self.phone_task(&task).is_some() {
+                    self.deliver_text(&task, &text);
+                }
+            }
+            remote::Command::Keys { task, keys } => {
+                if self.phone_task(&task).is_none() || !self.status_of(&task).running() {
+                    return;
+                }
+                let term = self.running.borrow().get(&task).map(|r| r.term.clone());
+                if let Some(term) = term {
+                    for key in keys {
+                        if let Some(bytes) = key_bytes(&key) {
+                            term.feed_child(bytes);
+                        }
+                    }
+                }
+            }
+            remote::Command::Open { task } => {
+                if self.phone_task(&task).is_none() {
+                    return;
+                }
+                if !self.status_of(&task).running() {
+                    self.launch(&task, None);
+                }
+                // Not on the desktop screen: lay it out for a phone.
+                let shown = self.stack.visible_child_name().as_deref() == Some(task.as_str())
+                    || self.pinned.borrow().as_deref() == Some(task.as_str());
+                if !shown && let Some(r) = self.running.borrow().get(&task) {
+                    r.term.set_size(PHONE_COLUMNS, 40);
+                }
+                let b = self.clone();
+                glib::timeout_add_local_once(Duration::from_millis(600), move || b.send_screen(&task));
+            }
+            remote::Command::NewTask { project, agent, title, prompt } => {
+                if agents::get(&agent).is_none_or(|a| a.id == "shell") || !agents::installed().iter().any(|a| a.id == agent) {
+                    return;
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                {
+                    let mut state = self.state.borrow_mut();
+                    let Some(p) = state.project_mut(&project) else { return };
+                    let title = if title.is_empty() { format!("task {}", p.sessions.len() + 1) } else { title };
+                    p.sessions.push(Session {
+                        id: id.clone(),
+                        agent,
+                        title,
+                        created: store::now(),
+                        launched: false,
+                        prompt: Some(prompt),
+                        archived: false,
+                        workflow: None,
+                        worktree: None,
+                        codex_id: None,
+                    });
+                    state.save();
+                }
+                self.launch(&id, None);
+                self.rebuild_sidebar();
+            }
+        }
+    }
+
+    fn open_phone_panel(self: &Rc<Self>) {
+        self.picker.fill("phone access   enter toggles or revokes · esc close", None, &[]);
+        *self.picker.mode.borrow_mut() = PickerMode::Phone;
+        self.fill_phone_panel();
+        self.picker.show();
+    }
+
+    fn fill_phone_panel(&self) {
+        let on = self.remote.borrow().is_some();
+        let port = phone_settings().port;
+        let mut rows = vec![
+            format!("phone access: {}   (enter to turn {})", if on { "on" } else { "off" }, if on { "off" } else { "on" }),
+            format!("address: {}", tailnet_address().unwrap_or_else(|| format!("run  tailscale serve --bg {port}  once"))),
+        ];
+        for d in self.phone_devices() {
+            rows.push(format!("revoke  {}   paired {}", d.name, workflow::stamp(d.paired)));
+        }
+        self.picker.set_options(&rows);
+    }
+
+    fn phone_devices(&self) -> Vec<remote::Device> {
+        match self.remote.borrow().as_ref() {
+            Some(r) => r.devices(),
+            None => remote::load_devices(),
+        }
+    }
+
+    fn phone_panel_pick(self: &Rc<Self>, idx: usize) {
+        match idx {
+            0 => {
+                let on = self.remote.borrow().is_none();
+                if on {
+                    self.start_remote();
+                } else {
+                    self.stop_remote();
+                }
+                save_phone_settings(&PhoneSettings { enabled: on, ..phone_settings() });
+                self.flash(if on { "phone access on" } else { "phone access off" });
+            }
+            1 => {}
+            n => {
+                if let Some(d) = self.phone_devices().get(n - 2) {
+                    match self.remote.borrow().as_ref() {
+                        Some(r) => r.revoke(&d.token_sha256),
+                        None => remote::revoke_device(&d.token_sha256),
+                    }
+                    self.flash(&format!("revoked {}", d.name));
+                }
+            }
+        }
+        self.fill_phone_panel();
+    }
+
     // ── git ────────────────────────────────────────────────────────────────
 
     /// Runs a git query at most every few seconds per key.
@@ -2195,8 +2530,15 @@ impl App {
     /// Delivers a message from another task: typed in now if the agent is
     /// free, queued if it is busy, or used to start it if it is stopped.
     fn receive(self: &Rc<Self>, from: &str, to: &str, text: &str) {
-        let Some(agent) = self.state.borrow().session(to).map(|(_, s)| s.agent.clone()) else { return };
         let msg = format!("Message from Codebench task {}: {text}", self.sender_label(from));
+        self.deliver_text(to, &msg);
+    }
+
+    /// Types a prompt into a task now if its agent is free, queues it while
+    /// it is busy, and starts the task with it if it is stopped.
+    fn deliver_text(self: &Rc<Self>, to: &str, msg: &str) {
+        let msg = msg.to_string();
+        let Some(agent) = self.state.borrow().session(to).map(|(_, s)| s.agent.clone()) else { return };
         let status = self.status_of(to);
         if status.running() {
             self.inbox.borrow_mut().entry(to.to_string()).or_default().push(msg);
@@ -2308,6 +2650,7 @@ impl App {
                 gdk::Key::b => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
                 gdk::Key::s => self.toggle_split(),
                 gdk::Key::k => self.toggle_browser(),
+                gdk::Key::y => self.open_phone_panel(),
                 gdk::Key::Left => {
                     let key = self.current_key.borrow().clone();
                     if let Some(t) = key.and_then(|k| self.running.borrow().get(&k).map(|r| r.term.clone())) {
@@ -2625,7 +2968,13 @@ impl App {
     }
 
     fn close_picker(self: &Rc<Self>) {
-        *self.picker.mode.borrow_mut() = PickerMode::Closed;
+        let mode = std::mem::replace(&mut *self.picker.mode.borrow_mut(), PickerMode::Closed);
+        if let PickerMode::Pair(id) = mode
+            && let Some(r) = self.remote.borrow().as_ref()
+        {
+            r.decide_pairing(&id, false);
+            self.flash("phone pairing denied");
+        }
         self.picker.root.set_visible(false);
         if let Some(t) = self.current_term() {
             t.grab_focus();
@@ -2641,6 +2990,18 @@ impl App {
             PickerMode::Accounts => {
                 *self.picker.mode.borrow_mut() = PickerMode::Accounts;
                 self.sign_in_picked(false);
+            }
+            PickerMode::Pair(id) => {
+                if let Some(r) = self.remote.borrow().as_ref() {
+                    r.decide_pairing(&id, true);
+                }
+                self.close_picker();
+                self.flash("phone paired");
+            }
+            PickerMode::Phone => {
+                let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0);
+                *self.picker.mode.borrow_mut() = PickerMode::Phone;
+                self.phone_panel_pick(idx as usize);
             }
             PickerMode::AddProject => {
                 let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;

@@ -8,6 +8,7 @@ mod mcp;
 mod limits;
 mod notes;
 mod progress;
+mod remote;
 mod store;
 mod theme;
 mod ui;
