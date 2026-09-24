@@ -1,4 +1,5 @@
 mod accounts;
+mod artifacts;
 mod agents;
 mod bus;
 mod chat;

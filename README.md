@@ -163,6 +163,21 @@ so the machine does not suspend mid-task. The screen still locks as usual.
 
 Drop files onto a task to type their paths into it.
 
+## Artifacts
+
+Ask an agent to show you something (a chart, a page mockup, a diagram, a
+document) and it uses the `show_artifact` tool: the artifact opens in a
+viewer window next to Codebench and reloads live as the agent revises it.
+HTML (scripts allowed), SVG, Mermaid, markdown, images and PDF all work.
+Each project's artifacts are listed under its **◆ artifacts** row and kept
+in `notes/artifacts/`, so Obsidian sees them too; the phone app lists them
+as well.
+
+Artifacts are served from their own port with a random key, and every page
+runs in a browser sandbox, so an artifact's scripts cannot reach Codebench
+or the phone app. To open them on the phone, also run
+`tailscale serve --bg --https=8443 47824`.
+
 ## A browser for agents
 
 `Ctrl+Shift+K` gives a project's Claude and Codex tasks a browser: Playwright's

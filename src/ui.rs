@@ -3,6 +3,7 @@
 
 use crate::accounts::{self, Account, Login};
 use crate::agents;
+use crate::artifacts;
 use crate::history::{self, Past};
 use crate::bus::{self, Request};
 use crate::git;
@@ -151,6 +152,7 @@ enum Row {
     Project(String),
     Notes(String),
     Git(String),
+    Artifacts(String),
     Session(String),
 }
 
@@ -213,6 +215,14 @@ fn trim_screen(html: &str) -> String {
     let body = html.trim().strip_prefix("<pre>").unwrap_or(html).strip_suffix("</pre>").unwrap_or(html);
     let body = body.trim_end().trim_start_matches(['\n', '\r']);
     format!("<pre>{body}\n</pre>")
+}
+
+/// Where phones reach artifacts: the tailnet https address on port 8443,
+/// if `tailscale serve --https=8443` points at the artifact server.
+fn artifact_address() -> Option<String> {
+    let out = std::process::Command::new("tailscale").args(["serve", "status", "--json"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["Web"].as_object()?.keys().find(|h| h.ends_with(":8443")).map(|h| format!("https://{h}"))
 }
 
 /// Terminal input for a key the phone sends.
@@ -379,6 +389,11 @@ struct App {
     remote: RefCell<Option<Rc<Remote>>>,
     /// Terminals with a screen capture for the phone already scheduled.
     screen_pending: RefCell<std::collections::HashSet<String>>,
+    artifact_server: Option<artifacts::Server>,
+    /// Viewer windows by artifact, so showing it again just reloads.
+    viewers: RefCell<HashMap<String, std::process::Child>>,
+    artifact_list: gtk::ListBox,
+    artifact_rows: RefCell<Vec<(String, String)>>,
     /// Holds off suspend while any agent is working.
     keep_awake: RefCell<Option<std::process::Child>>,
     current_project: RefCell<Option<String>>,
@@ -556,6 +571,15 @@ impl App {
         board_scroll.set_child(Some(&board));
         stack.add_named(&board_scroll, Some("project"));
 
+        // The artifacts page: one row per artifact, Enter or click opens it.
+        let artifact_list = gtk::ListBox::new();
+        artifact_list.set_selection_mode(gtk::SelectionMode::Single);
+        artifact_list.add_css_class("cb-board");
+        let artifact_scroll = gtk::ScrolledWindow::new();
+        artifact_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        artifact_scroll.set_child(Some(&artifact_list));
+        stack.add_named(&artifact_scroll, Some("artifacts"));
+
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
 
@@ -628,6 +652,10 @@ impl App {
             side_holder,
             pinned: RefCell::default(),
             keep_awake: RefCell::default(),
+            artifact_server: artifacts::Server::start().ok(),
+            viewers: RefCell::default(),
+            artifact_list,
+            artifact_rows: RefCell::default(),
             board,
             remote: RefCell::default(),
             screen_pending: RefCell::default(),
@@ -720,6 +748,7 @@ impl App {
             match kind {
                 Some(Row::Project(pid)) => b.show_project(&pid),
                 Some(Row::Notes(pid)) => b.show_notes(&pid),
+                Some(Row::Artifacts(pid)) => b.show_artifacts(&pid),
                 Some(Row::Git(pid)) => {
                     // Like tasks, open only if the row is still selected a
                     // moment later, so moving past it does not start lazygit.
@@ -739,6 +768,14 @@ impl App {
                 }
                 Some(Row::Session(sid)) => b.show_session(&sid),
                 None => {}
+            }
+        });
+
+        let b = self.clone();
+        self.artifact_list.connect_row_activated(move |_, row| {
+            let picked = b.artifact_rows.borrow().get(row.index() as usize).cloned();
+            if let Some((pid, file)) = picked {
+                b.open_viewer(&pid, &file);
             }
         });
 
@@ -904,6 +941,9 @@ impl App {
             if transient(&key) {
                 return self.current_project.borrow().clone().map(Row::Project);
             }
+            if let Some(pid) = key.strip_prefix("artifacts:") {
+                return Some(Row::Artifacts(pid.to_string()));
+            }
             return Some(match key.strip_prefix("notes:") {
                 Some(pid) => Row::Notes(pid.to_string()),
                 None => Row::Session(key),
@@ -956,6 +996,11 @@ impl App {
                 )));
                 rows.push(Row::Git(p.id.clone()));
             }
+
+            let made = artifacts::list(p).len();
+            let count = if made > 0 { format!("  {made}") } else { String::new() };
+            self.sidebar.append(&row_with(&format!("  <span foreground='{m}'>◆ artifacts{count}</span>", m = theme.muted)));
+            rows.push(Row::Artifacts(p.id.clone()));
 
             for s in p.sessions.iter().filter(|s| show_archived || !s.archived) {
                 let (glyph, color, word) = self.status_of(&s.id).look(&theme);
@@ -1996,6 +2041,86 @@ impl App {
         self.flash(&format!("imported \"{}\". pick more, or esc", past.title));
     }
 
+    // ── artifacts ──────────────────────────────────────────────────────────
+
+    fn show_artifacts(self: &Rc<Self>, pid: &str) {
+        let Some(p) = self.state.borrow().project(pid).cloned() else { return };
+        *self.current_project.borrow_mut() = Some(pid.to_string());
+        *self.current_key.borrow_mut() = Some(format!("artifacts:{pid}"));
+        while let Some(child) = self.artifact_list.first_child() {
+            self.artifact_list.remove(&child);
+        }
+        let list = artifacts::list(&p);
+        let theme = self.theme.borrow();
+        if list.is_empty() {
+            let l = label("cb-dim");
+            l.set_wrap(true);
+            l.set_text(
+                "no artifacts yet.\n\nAsk an agent to show you something (\"make a chart of…\", \"sketch the page as HTML\", \"draw the architecture as a mermaid diagram\") and it appears here and opens in a viewer next to Codebench.",
+            );
+            self.artifact_list.append(&l);
+        }
+        let mut rows = Vec::new();
+        for a in &list {
+            let l = gtk::Label::new(None);
+            l.set_xalign(0.0);
+            l.set_markup(&format!(
+                "<span foreground='{}'>◆</span> {}   <span foreground='{}'>{} · {}</span>",
+                theme.accent,
+                esc(&a.title),
+                theme.muted,
+                a.kind,
+                workflow::stamp(a.modified)
+            ));
+            self.artifact_list.append(&l);
+            rows.push((pid.to_string(), a.file.clone()));
+        }
+        *self.artifact_rows.borrow_mut() = rows;
+        self.stack.set_visible_child_name("artifacts");
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>{}</b></span>  <span foreground='{}'>›</span>  artifacts",
+            theme.accent,
+            esc(&p.name),
+            theme.muted
+        ));
+        self.header_right.set_text(&tilde(&artifacts::dir(&p)));
+    }
+
+    /// Opens an artifact in its own window next to Codebench (a Chromium
+    /// app window when available). An open viewer reloads by itself, so
+    /// showing the same artifact again does not open a second one.
+    fn open_viewer(self: &Rc<Self>, pid: &str, file: &str) {
+        let Some(server) = self.artifact_server.as_ref() else {
+            self.flash("the artifact viewer could not start (port in use?)");
+            return;
+        };
+        let url = server.local_url(pid, file);
+        let key = format!("{pid}/{file}");
+        let open = self.viewers.borrow_mut().get_mut(&key).is_some_and(|c| c.try_wait().ok().flatten().is_none());
+        if open {
+            return;
+        }
+        let child = match agents::chromium() {
+            Some(chrome) => std::process::Command::new(chrome)
+                .arg(format!("--app={url}"))
+                .arg(format!("--user-data-dir={}", store::cache_dir().join("viewer").display()))
+                .args(["--no-first-run", "--no-default-browser-check", "--new-window"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn(),
+            None => std::process::Command::new("xdg-open").arg(&url).spawn(),
+        };
+        match child {
+            Ok(c) => {
+                self.viewers.borrow_mut().insert(key, c);
+            }
+            Err(e) => self.flash(&format!("could not open the viewer: {e}")),
+        }
+        if self.current_key.borrow().as_deref() == Some(&format!("artifacts:{pid}")) {
+            self.show_artifacts(pid);
+        }
+    }
+
     // ── phone ──────────────────────────────────────────────────────────────
 
     fn start_remote(self: &Rc<Self>) {
@@ -2008,6 +2133,9 @@ impl App {
             }
         };
         remote.publish_theme(phone_css(&self.theme.borrow()));
+        if let Some(server) = self.artifact_server.as_ref() {
+            remote.set_artifacts(artifact_address(), server.key.clone());
+        }
         let commands = remote.commands.clone();
         *self.remote.borrow_mut() = Some(remote);
         self.rebuild_sidebar();
@@ -2349,6 +2477,10 @@ impl App {
                 self.select(&Row::Project(pid.clone()));
                 self.show_project(&pid);
             }
+            Some(Row::Artifacts(pid)) => {
+                self.select(&Row::Artifacts(pid.clone()));
+                self.show_artifacts(&pid);
+            }
             None => self.show_empty(),
         }
         self.rebuild_sidebar();
@@ -2576,6 +2708,14 @@ impl App {
                 Request::Send { from, to, text } => self.receive(&from, &to, &text),
                 Request::StartTask { from, title, agent, prompt } => {
                     self.start_task_for(&from, &title, &agent, &prompt)
+                }
+                Request::ShowArtifact { from, file } => {
+                    let pid = self.state.borrow().session(&from).map(|(p, _)| p.id.clone());
+                    if let Some(pid) = pid {
+                        self.rebuild_sidebar();
+                        self.open_viewer(&pid, &file);
+                        self.flash(&format!("{} showed an artifact: {file}", self.sender_label(&from)));
+                    }
                 }
             }
         }
@@ -2913,7 +3053,7 @@ impl App {
         let Some(target) = self.selected_row() else { return };
         let key = match &target {
             Row::Project(id) | Row::Session(id) => id.clone(),
-            Row::Notes(_) | Row::Git(_) => return,
+            Row::Notes(_) | Row::Git(_) | Row::Artifacts(_) => return,
         };
         let armed = self
             .pending_delete
@@ -2941,7 +3081,7 @@ impl App {
                 .project(pid)
                 .map(|p| p.sessions.iter().map(|s| s.id.clone()).chain([notes_key(pid)]).collect())
                 .unwrap_or_default(),
-            Row::Notes(_) | Row::Git(_) => Vec::new(),
+            Row::Notes(_) | Row::Git(_) | Row::Artifacts(_) => Vec::new(),
         };
         for key in &doomed {
             self.stop(key);
@@ -2973,7 +3113,7 @@ impl App {
                 state.projects.retain(|p| &p.id != pid);
                 state.projects.first().map(|p| Row::Project(p.id.clone()))
             }
-            Row::Notes(_) | Row::Git(_) => None,
+            Row::Notes(_) | Row::Git(_) | Row::Artifacts(_) => None,
         };
         state.save();
         drop(state);

@@ -14,6 +14,8 @@ pub enum Request {
     Send { from: String, to: String, text: String },
     /// Create a task in the sender's project and start it with a prompt.
     StartTask { from: String, title: String, agent: String, prompt: String },
+    /// Show an artifact the task saved, in a viewer window.
+    ShowArtifact { from: String, file: String },
 }
 
 pub fn dir() -> PathBuf {

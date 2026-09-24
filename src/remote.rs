@@ -73,6 +73,8 @@ struct Shared {
     watched: HashSet<String>,
     pairings: HashMap<String, Pairing>,
     devices: Vec<Device>,
+    /// Where phones reach artifacts (tailnet https base) and their key.
+    artifacts: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -136,7 +138,7 @@ fn sha256_hex(text: &str) -> String {
 }
 
 /// The Tailscale login of this machine, from `tailscale status --json`.
-fn tailscale_owner() -> Option<String> {
+pub fn tailscale_owner() -> Option<String> {
     let out = std::process::Command::new("tailscale").args(["status", "--json"]).output().ok()?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let uid = v["Self"]["UserID"].to_string();
@@ -249,6 +251,10 @@ impl Remote {
         });
     }
 
+    pub fn set_artifacts(&self, base: Option<String>, key: String) {
+        self.shared.lock().unwrap().artifacts = base.map(|b| (b, key));
+    }
+
     pub fn devices(&self) -> Vec<Device> {
         self.shared.lock().unwrap().devices.clone()
     }
@@ -279,6 +285,7 @@ fn router(ctx: Ctx) -> Router {
         .route("/sw.js", get(|| async { page(SW_JS, "text/javascript; charset=utf-8") }))
         .route("/icon-192.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], ICON_192).into_response() }))
         .route("/icon-512.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], ICON_512).into_response() }))
+        .route("/api/artifacts", get(artifact_list))
         .route("/api/push/key", get(push_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/test", post(push_test))
@@ -491,6 +498,30 @@ async fn new_task(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<NewT
         .send(Command::NewTask { project: b.project, agent: b.agent, title: b.title, prompt: b.prompt })
         .await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn artifact_list(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    let access = ctx.shared.lock().unwrap().artifacts.clone();
+    let list = tokio::task::spawn_blocking(move || {
+        let state = crate::store::State::load();
+        state
+            .projects
+            .iter()
+            .flat_map(|p| {
+                let access = access.clone();
+                crate::artifacts::list(p).into_iter().map(move |a| {
+                    let url = access.as_ref().map(|(base, key)| format!("{base}/v/{}/{}?k={key}", p.id, a.file));
+                    serde_json::json!({ "project": p.name, "title": a.title, "kind": a.kind, "modified": a.modified, "url": url })
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(serde_json::json!({ "artifacts": list })).into_response()
 }
 
 async fn push_key(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {

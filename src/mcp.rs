@@ -81,6 +81,20 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "show_artifact",
+            "description": "Show the user something visual in a viewer window next to Codebench: an HTML page (self-contained, scripts allowed), an SVG, a Mermaid diagram, a markdown document, or an image or PDF you made. Pass content with a kind, or the path of a file you wrote. Showing the same title again updates it, and the viewer reloads.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short name; also its file name" },
+                    "kind": { "type": "string", "description": "html, svg, mermaid, markdown, png, jpg, gif, webp or pdf" },
+                    "content": { "type": "string", "description": "The artifact's text (html, svg, mermaid, markdown)" },
+                    "path": { "type": "string", "description": "Instead of content: a file to show (it is copied)" },
+                },
+                "required": ["title"],
+            },
+        },
+        {
             "name": "start_task",
             "description": "Start a new task on this project with its own fresh conversation.",
             "inputSchema": {
@@ -140,6 +154,18 @@ fn call(me: &str, tool: &str, args: &Value) -> Result<String, String> {
             })
             .map_err(|e| e.to_string())?;
             Ok(format!("started \"{title}\" ({agent})"))
+        }
+        "show_artifact" => {
+            let title = str_arg(args, "title")?;
+            let content = args.get("content").and_then(Value::as_str);
+            let path = args.get("path").and_then(Value::as_str).map(|p| {
+                let p = std::path::PathBuf::from(p);
+                if p.is_relative() { me_session.dir(project).join(p) } else { p }
+            });
+            let kind = args.get("kind").and_then(Value::as_str);
+            let file = crate::artifacts::save(project, title, kind, content, path.as_deref())?;
+            bus::post(&Request::ShowArtifact { from: me.to_string(), file: file.clone() }).map_err(|e| e.to_string())?;
+            Ok(format!("showing \"{title}\" ({file}). It updates when you show the same title again."))
         }
         _ => Err(format!("unknown tool {tool}")),
     }

@@ -42,7 +42,9 @@ pub fn agent_context(project: &Project) -> String {
         "You are running as a task inside Codebench. Project notes live in {}: \
          brief.md is the project brief, handoffs/ holds notes from earlier tasks. \
          When you learn something every future task on this project should know, \
-         add it to brief.md and keep that file short.",
+         add it to brief.md and keep that file short. To show the user something \
+         visual (a page, chart, diagram or document), use the codebench \
+         show_artifact tool.",
         dir.display()
     );
     if let Some(brief) = brief(project) {

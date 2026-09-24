@@ -144,6 +144,7 @@ function render() {
   if (route === "new") return newView(arg ? decodeURIComponent(arg) : "");
   if (route === "pair") return token ? go("#/") : pairView();
   if (route === "settings") return settingsView();
+  if (route === "artifacts") return artifactsView();
   return inboxView();
 }
 
@@ -174,6 +175,10 @@ function inboxView() {
         `${u.agent}  ` + u.limits.map(l => `${l.name} ${l.percent}%`).join(" · "));
     })));
   }
+
+  view.append(h("div", { class: "row", onclick: () => go("#/artifacts") },
+    h("span", { class: "glyph accent" }, "◆"),
+    h("div", { class: "main" }, h("div", { class: "t" }, "artifacts"), h("div", { class: "s" }, "visuals your agents made"))));
 
   const all = state.projects.flatMap(p => p.tasks.map(t => [p, t]));
   const needs = all.filter(([, t]) => t.kind === "needs");
@@ -379,6 +384,30 @@ function newView(pid) {
         go("#/");
       } catch (e) { toast(e.message); }
     } }, "start task")), flows);
+}
+
+// ---------------------------------------------------------------- artifacts
+
+async function artifactsView() {
+  watching = null;
+  back.hidden = false;
+  title.textContent = "artifacts";
+  view.replaceChildren(h("div", { class: "empty" }, "loading…"));
+  let r;
+  try { r = await api("/api/artifacts"); } catch (e) { toast(e.message); return; }
+  if (!r.artifacts.length) {
+    view.replaceChildren(h("div", { class: "empty" }, "no artifacts yet. ask an agent to show you something."));
+    return;
+  }
+  const rows = [];
+  let last = null;
+  for (const a of r.artifacts.sort((x, y) => x.project.localeCompare(y.project) || y.modified - x.modified)) {
+    if (a.project !== last) { rows.push(h("div", { class: "section" }, a.project)); last = a.project; }
+    rows.push(h("div", { class: "row", onclick: () => a.url ? window.open(a.url, "_blank", "noopener") : toast("run  tailscale serve --bg --https=8443 47824  on the computer to view artifacts here") },
+      h("span", { class: "glyph accent" }, "◆"),
+      h("div", { class: "main" }, h("div", { class: "t" }, a.title), h("div", { class: "s" }, a.kind + " · " + new Date(a.modified * 1000).toLocaleString()))));
+  }
+  view.replaceChildren(...rows);
 }
 
 // ---------------------------------------------------------------- settings
