@@ -58,6 +58,7 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+S` | Split: pin this task on the right, pick another for the left; again to unpin |
 | `Ctrl+Shift+←/→` | Focus the left or right side of a split |
 | `Ctrl+Shift+B` | Toggle the sidebar (drag its edge to resize) |
+| `Ctrl+Shift+T` | Toggle the project tabs and view bar |
 | `Ctrl+Shift+C/V` | Copy and paste |
 | `Ctrl+1…9`, `Ctrl+PgUp/PgDn` | Switch project tab |
 | `Alt+1…7` | Views: tasks, files, notes, workflows, artifacts, git, processes |
@@ -179,7 +180,9 @@ to jump straight to it. `install.sh` links it into
 While any agent is working, Codebench holds a `systemd-inhibit` sleep lock
 so the machine does not suspend mid-task. The screen still locks as usual.
 
-Drop files onto a task to type their paths into it.
+Drop files onto a task to type their paths into it, or onto the notes or
+artifacts view to copy them into that folder. Screenshots on the clipboard
+paste into Claude Code with its own `Ctrl+V`.
 
 ## Artifacts
 

@@ -116,6 +116,7 @@ enum Action {
     Archived,
     Sidebar,
     Files,
+    TopBars,
 }
 
 const ACTIONS: &[(&str, &str, Action)] = &[
@@ -139,6 +140,7 @@ const ACTIONS: &[(&str, &str, Action)] = &[
     ("Ctrl+Shift+D", "delete task or remove project (press twice)", Action::Delete),
     ("Ctrl+Shift+A", "show or hide handed-off tasks", Action::Archived),
     ("Ctrl+Shift+B", "show or hide the sidebar", Action::Sidebar),
+    ("Ctrl+Shift+T", "show or hide the project tabs and view bar", Action::TopBars),
 ];
 
 /// Keys with no action of their own, listed after the actions.
@@ -479,6 +481,8 @@ struct App {
     /// Viewer windows by artifact, so showing it again just reloads.
     viewers: RefCell<HashMap<String, std::process::Child>>,
     tabs_box: gtk::Box,
+    tabbar: gtk::Box,
+    viewbar: gtk::Box,
     view_buttons: Vec<(View, gtk::Button)>,
     view: Cell<View>,
     page_title: gtk::Label,
@@ -741,8 +745,8 @@ impl App {
         root.set_start_child(Some(&sidebar_box));
         root.set_end_child(Some(&main));
         let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        shell.append(&tabbar);
-        shell.append(&viewbar);
+        shell.append(&tabbar.clone());
+        shell.append(&viewbar.clone());
         shell.append(&root);
         root.set_position(ui_settings().sidebar_width);
         root.connect_position_notify(|paned| {
@@ -794,6 +798,8 @@ impl App {
             artifact_server: artifacts::Server::start().ok(),
             viewers: RefCell::default(),
             tabs_box,
+            tabbar,
+            viewbar,
             view_buttons,
             view: Cell::new(View::Tasks),
             page_title,
@@ -936,6 +942,16 @@ impl App {
             }
         });
         self.page_list.add_controller(page_keys);
+
+        // Drop files on the notes or artifacts view to copy them in.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let b = self.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            let Ok(list) = value.get::<gdk::FileList>() else { return false };
+            let files: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+            b.drop_into_view(files)
+        });
+        self.stack.add_controller(drop);
 
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1323,6 +1339,36 @@ impl App {
                 self.show_project(pid);
             }
         }
+    }
+
+    fn toggle_top_bars(&self) {
+        let show = !self.tabbar.is_visible();
+        self.tabbar.set_visible(show);
+        self.viewbar.set_visible(show);
+    }
+
+    /// Copies files dropped on the notes or artifacts view into that folder.
+    fn drop_into_view(self: &Rc<Self>, files: Vec<PathBuf>) -> bool {
+        let Some(pid) = self.current_project.borrow().clone() else { return false };
+        let Some(p) = self.state.borrow().project(&pid).cloned() else { return false };
+        let dest = match self.view.get() {
+            View::Notes => notes::ensure(&p),
+            View::Artifacts => artifacts::dir(&p),
+            _ => return false,
+        };
+        let _ = std::fs::create_dir_all(&dest);
+        let mut copied = 0;
+        for f in files.iter().filter(|f| f.is_file()) {
+            if let Some(name) = f.file_name()
+                && std::fs::copy(f, dest.join(name)).is_ok()
+            {
+                copied += 1;
+            }
+        }
+        self.flash(&format!("copied {copied} file{} into {}", if copied == 1 { "" } else { "s" }, tilde(&dest)));
+        let view = self.view.get();
+        self.show_view(view);
+        copied > 0
     }
 
     /// Moves to the tab `delta` away from the current one, wrapping.
@@ -3385,6 +3431,7 @@ impl App {
                     });
                 }
                 gdk::Key::b => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
+                gdk::Key::t => self.toggle_top_bars(),
                 gdk::Key::s => self.toggle_split(),
                 gdk::Key::k => self.toggle_browser(),
                 gdk::Key::y => self.open_phone_panel(),
@@ -3802,6 +3849,7 @@ impl App {
             }
             Action::Sidebar => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
             Action::Files => self.open_files(),
+            Action::TopBars => self.toggle_top_bars(),
         }
     }
 
