@@ -182,7 +182,7 @@ weekly limits from `claude /usage`, and Codex's 5-hour and weekly windows
 from its latest session. They refresh every ten minutes, and the bar
 widget's dropdown shows them too.
 
-The sidebar also shows which agents are signed in. `Ctrl+Shift+U`
+The sidebar also shows which agents are signed in. `F2`
 lists each agent's login (for Claude, the plan and organization), signs in
 with Enter, or switches account with `s` (sign out, then in), in a pane that
 closes when done. `codebench accounts` prints the same from a terminal.
