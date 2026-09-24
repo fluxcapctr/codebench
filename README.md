@@ -45,10 +45,10 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+H` | Hand off: the agent writes a note, the task continues in a fresh session |
 | `Ctrl+Shift+O` | Add a project: new (creates the folder with git), one of your folders, or browse |
 | `Ctrl+Shift+I` | Import past Claude and Codex chats for this project |
-| `Ctrl+Shift+U` | Accounts: logins per agent, sign in, switch account |
+| `F2` | Accounts: logins, limits, sign in, switch account, update agents (also `Ctrl+Shift+U`, which fcitx5 takes on Omarchy) |
 | `Ctrl+Shift+L` | Link the project's notes to a folder, such as one in your Obsidian vault |
-| `Ctrl+Shift+J` | Open the brief in Obsidian |
-| `Ctrl+Shift+R` | Rename the task |
+| `Ctrl+Shift+J` | Open the brief in Obsidian (asks for a vault folder first if the notes are not in one) |
+| `Ctrl+Shift+R` | Rename the task or project (the folder keeps its name) |
 | `Ctrl+Shift+W` | Stop the task's agent (select it again to resume) |
 | `Ctrl+Shift+D` | Delete the task, or remove the project (press twice) |
 | `Ctrl+Shift+A` | Show or hide handed-off tasks |
@@ -59,7 +59,7 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+B` | Toggle the sidebar |
 | `Ctrl+Shift+C/V` | Copy and paste |
 | `Alt+Up/Down` | Move through projects, notes and tasks |
-| `F1` | All keys |
+| `F1` | All commands: type to filter, Enter runs one |
 
 ## Project board
 
@@ -177,7 +177,7 @@ Needs node (`npx`); uses your installed Chromium.
 
 The bottom of the sidebar shows which agents are signed in, and for Claude
 and Codex how much of their tightest rate limit is used (yellow past 60%,
-red past 80%). `Ctrl+Shift+U` lists every limit: Claude's session and
+red past 80%). `F2` lists every limit: Claude's session and
 weekly limits from `claude /usage`, and Codex's 5-hour and weekly windows
 from its latest session. They refresh every ten minutes, and the bar
 widget's dropdown shows them too.

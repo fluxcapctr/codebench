@@ -26,30 +26,59 @@ use vte::prelude::*;
 
 pub const APP_ID: &str = "co.ericstevens.codebench";
 
-const HINTS: &str = "^⇧N new task   ^⇧P workflows   ^⇧G git   ^⇧E notes   ^⇧H handoff   alt ↑↓ switch   F1 all keys";
+const HINTS: &str = "^⇧N new task   ^⇧P workflows   ^⇧G git   ^⇧E notes   ^⇧H handoff   alt ↑↓ switch   F1 all commands";
 
-const KEYS: &[(&str, &str)] = &[
-    ("Ctrl+Shift+N", "new task in this project"),
-    ("Ctrl+Shift+P", "workflows: run, edit (^E) or create saved prompts"),
-    ("Ctrl+Shift+E", "edit project notes (brief and handoffs)"),
-    ("Ctrl+Shift+G", "git (lazygit) for this task or project"),
-    ("Ctrl+Shift+M", "merge a worktree task back into its branch (press twice)"),
+/// Everything Codebench can do, with its key. F1 lists these and runs the
+/// one you pick, so a key another program grabs never locks you out.
+#[derive(Clone, Copy)]
+enum Action {
+    NewTask,
+    Workflows,
+    Notes,
+    Handoff,
+    AddProject,
+    Import,
+    Accounts,
+    Phone,
+    LinkNotes,
+    Obsidian,
+    Rename,
+    Git,
+    Merge,
+    Browser,
+    Split,
+    Stop,
+    Delete,
+    Archived,
+    Sidebar,
+}
+
+const ACTIONS: &[(&str, &str, Action)] = &[
+    ("Ctrl+Shift+N", "new task in this project", Action::NewTask),
+    ("Ctrl+Shift+P", "workflows: run, edit (^E) or create saved prompts", Action::Workflows),
+    ("Ctrl+Shift+E", "edit project notes (brief and handoffs)", Action::Notes),
+    ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session", Action::Handoff),
+    ("Ctrl+Shift+O", "add a project: new (with git), one of your folders, or browse", Action::AddProject),
+    ("Ctrl+Shift+I", "import past Claude and Codex chats for this project", Action::Import),
+    ("F2", "accounts: logins, limits, sign in, update agents (also Ctrl+Shift+U)", Action::Accounts),
+    ("Ctrl+Shift+Y", "phone access: on or off, address, paired phones", Action::Phone),
+    ("Ctrl+Shift+L", "link notes to a folder, e.g. in your Obsidian vault", Action::LinkNotes),
+    ("Ctrl+Shift+J", "open the brief in Obsidian", Action::Obsidian),
+    ("Ctrl+Shift+R", "rename the task or project", Action::Rename),
+    ("Ctrl+Shift+G", "git (lazygit) for this task or project", Action::Git),
+    ("Ctrl+Shift+M", "merge a worktree task back into its branch (press twice)", Action::Merge),
+    ("Ctrl+Shift+K", "give this project's agents a browser (on or off)", Action::Browser),
+    ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left", Action::Split),
+    ("Ctrl+Shift+W", "stop task (select it again to resume)", Action::Stop),
+    ("Ctrl+Shift+D", "delete task or remove project (press twice)", Action::Delete),
+    ("Ctrl+Shift+A", "show or hide handed-off tasks", Action::Archived),
+    ("Ctrl+Shift+B", "show or hide the sidebar", Action::Sidebar),
+];
+
+/// Keys with no action of their own, listed after the actions.
+const OTHER_KEYS: &[(&str, &str)] = &[
     ("Tab", "in the new task box: give the task its own git worktree"),
-    ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session"),
-    ("Ctrl+Shift+O", "add a project: new (with git), one of your folders, or browse"),
-    ("Ctrl+Shift+I", "import past Claude and Codex chats for this project"),
-    ("Ctrl+Shift+U", "accounts: see logins, sign in, switch accounts"),
-    ("Ctrl+Shift+L", "link notes to a folder, e.g. in your Obsidian vault"),
-    ("Ctrl+Shift+J", "open the brief in Obsidian"),
-    ("Ctrl+Shift+R", "rename task"),
-    ("Ctrl+Shift+W", "stop task (select it again to resume)"),
-    ("Ctrl+Shift+D", "delete task or remove project (press twice)"),
-    ("Ctrl+Shift+A", "show or hide handed-off tasks"),
-    ("Ctrl+Shift+K", "give this project's agents a browser (on or off)"),
-    ("Ctrl+Shift+Y", "phone access: on or off, address, paired phones"),
-    ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left"),
     ("Ctrl+Shift+← / →", "focus the left or right side of a split"),
-    ("Ctrl+Shift+B", "show or hide the sidebar"),
     ("Ctrl+Shift+C / V", "copy / paste"),
     ("Alt+Up / Down", "previous / next row"),
 ];
@@ -227,6 +256,12 @@ fn short_limit(name: &str) -> String {
     }
 }
 
+/// Opens the brief in Obsidian.
+fn open_obsidian(notes_dir: &Path) {
+    let uri = notes::obsidian_uri(&notes_dir.join("brief.md"));
+    let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
+}
+
 /// Panes that close themselves when their program exits.
 fn transient(key: &str) -> bool {
     key.starts_with("edit:") || key.starts_with("git:") || key.starts_with("auth:")
@@ -240,6 +275,7 @@ enum PickerMode {
     Closed,
     NewTask,
     Rename(String),
+    RenameProject(String),
     Help,
     Workflows(String),
     Accounts,
@@ -274,6 +310,8 @@ struct Picker {
     past: RefCell<Vec<Past>>,
     /// AddProject mode rows.
     add_choices: RefCell<Vec<AddChoice>>,
+    /// Help mode rows: indexes into ACTIONS.
+    actions: RefCell<Vec<usize>>,
 }
 
 struct Running {
@@ -725,6 +763,7 @@ impl App {
                 PickerMode::Workflows(pid) => b.fill_workflows(pid),
                 PickerMode::Import(_) => b.fill_import(),
                 PickerMode::AddProject => b.fill_add_project(),
+                PickerMode::Help => b.fill_help(),
                 _ => {}
             }
         });
@@ -770,12 +809,6 @@ impl App {
             }
             let step = match key {
                 gdk::Key::Escape => {
-                    b.close_picker();
-                    return glib::Propagation::Stop;
-                }
-                gdk::Key::Return | gdk::Key::KP_Enter
-                    if matches!(*b.picker.mode.borrow(), PickerMode::Help) =>
-                {
                     b.close_picker();
                     return glib::Propagation::Stop;
                 }
@@ -1126,7 +1159,7 @@ impl App {
             }
             out.push('\n');
         }
-        out.push_str(&dim("^⇧N new task   ^⇧P workflows   ^⇧E notes   ^⇧I import past chats   ^⇧G git   F1 all keys"));
+        out.push_str(&dim("^⇧N new task   ^⇧P workflows   ^⇧E notes   ^⇧I import past chats   ^⇧G git   F1 all commands"));
         out
     }
 
@@ -1788,7 +1821,7 @@ impl App {
                 Login::Unknown(_) => format!("{} ?", a.agent),
             })
             .collect();
-        self.agents_label.set_markup(&format!("{}   ^⇧U", parts.join("  ")));
+        self.agents_label.set_markup(&format!("{}   F2", parts.join("  ")));
     }
 
     fn open_accounts(self: &Rc<Self>) {
@@ -2265,6 +2298,18 @@ impl App {
         state.project(&pid).map(|p| p.path.clone())
     }
 
+    fn open_git_here(self: &Rc<Self>) {
+        let dir = self.current_dir();
+        match dir {
+            Some(dir) if git::is_repo(&dir) => {
+                *self.return_to.borrow_mut() = self.selected_row();
+                self.open_git(&dir);
+            }
+            Some(_) => self.flash("this project is not a git repository"),
+            None => self.flash("select a project first"),
+        }
+    }
+
     /// lazygit in its own pane; quitting it returns to where you were.
     fn open_git(self: &Rc<Self>, dir: &Path) {
         let key = format!("git:{}", dir.display());
@@ -2629,28 +2674,23 @@ impl App {
             self.open_help();
             return glib::Propagation::Stop;
         }
+        // F2 because fcitx5 (and GTK) take Ctrl+Shift+U for unicode input.
+        if key == gdk::Key::F2 && !ctrl && !alt {
+            self.open_accounts();
+            return glib::Propagation::Stop;
+        }
         if ctrl && shift && !alt {
             match key {
                 gdk::Key::n => self.open_new_task(),
                 gdk::Key::p => self.open_workflows(),
-                gdk::Key::g => {
-                    let dir = self.current_dir();
-                    match dir {
-                        Some(dir) if git::is_repo(&dir) => {
-                            *self.return_to.borrow_mut() = self.selected_row();
-                            self.open_git(&dir);
-                        }
-                        Some(_) => self.flash("this project is not a git repository"),
-                        None => self.flash("select a project first"),
-                    }
-                }
+                gdk::Key::g => self.open_git_here(),
                 gdk::Key::m => self.merge_current(),
                 gdk::Key::e => self.open_notes(),
                 gdk::Key::h => self.start_handoff(),
                 gdk::Key::o => self.open_add_project(),
                 gdk::Key::u => self.open_accounts(),
                 gdk::Key::i => self.open_import(),
-                gdk::Key::l => self.link_notes_dialog(),
+                gdk::Key::l => self.link_notes_dialog(false),
                 gdk::Key::j => self.open_in_obsidian(),
                 gdk::Key::r => self.open_rename(),
                 gdk::Key::w => self.stop_current(),
@@ -2809,7 +2849,9 @@ impl App {
 
     /// Points the project's notes at another folder, such as one in an
     /// Obsidian vault, carrying the existing brief and handoffs across.
-    fn link_notes_dialog(self: &Rc<Self>) {
+    /// Points the notes at another folder. With `then_open`, opens the brief
+    /// in Obsidian afterwards if the folder is in a vault.
+    fn link_notes_dialog(self: &Rc<Self>, then_open: bool) {
         let Some(pid) = self.current_project.borrow().clone() else {
             self.flash("select a project first");
             return;
@@ -2835,8 +2877,14 @@ impl App {
             b.stop(&key);
             b.rebuild_sidebar();
             b.update_header();
-            let where_ = if notes::vault_root(&dir).is_some() { "in your vault" } else { "" };
+            let in_vault = notes::vault_root(&dir).is_some();
+            let where_ = if in_vault { "in your vault" } else { "" };
             b.flash(&format!("notes now live {where_} at {}", tilde(&dir)));
+            if then_open && in_vault {
+                open_obsidian(&dir);
+            } else if then_open {
+                b.flash("that folder is not inside an Obsidian vault, so Obsidian cannot open it");
+            }
         });
     }
 
@@ -2845,11 +2893,13 @@ impl App {
         let Some(project) = self.state.borrow().project(&pid).cloned() else { return };
         let dir = notes::ensure(&project);
         if notes::vault_root(&dir).is_none() {
-            self.flash("these notes are not in an Obsidian vault. ^⇧L links them to a vault folder");
+            // Obsidian only opens files inside a vault: pick a folder there
+            // first, then the brief opens.
+            self.flash("these notes are not in your vault yet. pick a folder in it for them");
+            self.link_notes_dialog(true);
             return;
         }
-        let uri = notes::obsidian_uri(&dir.join("brief.md"));
-        let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
+        open_obsidian(&dir);
     }
 
     fn stop_current(self: &Rc<Self>) {
@@ -2970,18 +3020,66 @@ impl App {
     }
 
     fn open_rename(self: &Rc<Self>) {
-        let Some(Row::Session(sid)) = self.selected_row() else { return };
-        let title = self.state.borrow().session(&sid).map(|(_, s)| s.title.clone()).unwrap_or_default();
-        self.picker.fill("rename task", Some(("task name", &title)), &[]);
-        *self.picker.mode.borrow_mut() = PickerMode::Rename(sid);
-        self.picker.show();
+        match self.selected_row() {
+            Some(Row::Session(sid)) => {
+                let title = self.state.borrow().session(&sid).map(|(_, s)| s.title.clone()).unwrap_or_default();
+                self.picker.fill("rename task", Some(("task name", &title)), &[]);
+                *self.picker.mode.borrow_mut() = PickerMode::Rename(sid);
+                self.picker.show();
+            }
+            Some(Row::Project(pid)) => {
+                let name = self.state.borrow().project(&pid).map(|p| p.name.clone()).unwrap_or_default();
+                self.picker.fill("rename project (the folder is not renamed)", Some(("project name", &name)), &[]);
+                *self.picker.mode.borrow_mut() = PickerMode::RenameProject(pid);
+                self.picker.show();
+            }
+            _ => self.flash("select a task or a project to rename it"),
+        }
     }
 
     fn open_help(self: &Rc<Self>) {
-        let lines: Vec<String> = KEYS.iter().map(|(k, what)| format!("{k:<18}{what}")).collect();
-        self.picker.fill("keys   (esc to close)", None, &lines);
+        self.picker.fill("commands   type to filter · enter runs · esc closes", Some(("filter", "")), &[]);
         *self.picker.mode.borrow_mut() = PickerMode::Help;
+        self.fill_help();
         self.picker.show();
+    }
+
+    fn fill_help(&self) {
+        let filter = self.picker.entry.text().trim().to_lowercase();
+        let matches = |k: &str, what: &str| filter.is_empty() || what.to_lowercase().contains(&filter) || k.to_lowercase().contains(&filter);
+        let picked: Vec<usize> = ACTIONS.iter().enumerate().filter(|(_, (k, w, _))| matches(k, w)).map(|(i, _)| i).collect();
+        let mut lines: Vec<String> = picked.iter().map(|&i| format!("{:<18}{}", ACTIONS[i].0, ACTIONS[i].1)).collect();
+        lines.extend(OTHER_KEYS.iter().filter(|(k, w)| matches(k, w)).map(|(k, w)| format!("{k:<18}{w}")));
+        self.picker.set_options(&lines);
+        *self.picker.actions.borrow_mut() = picked;
+    }
+
+    fn run_action(self: &Rc<Self>, action: Action) {
+        match action {
+            Action::NewTask => self.open_new_task(),
+            Action::Workflows => self.open_workflows(),
+            Action::Notes => self.open_notes(),
+            Action::Handoff => self.start_handoff(),
+            Action::AddProject => self.open_add_project(),
+            Action::Import => self.open_import(),
+            Action::Accounts => self.open_accounts(),
+            Action::Phone => self.open_phone_panel(),
+            Action::LinkNotes => self.link_notes_dialog(false),
+            Action::Obsidian => self.open_in_obsidian(),
+            Action::Rename => self.open_rename(),
+            Action::Git => self.open_git_here(),
+            Action::Merge => self.merge_current(),
+            Action::Browser => self.toggle_browser(),
+            Action::Split => self.toggle_split(),
+            Action::Stop => self.stop_current(),
+            Action::Delete => self.delete_current(),
+            Action::Archived => {
+                self.show_archived.set(!self.show_archived.get());
+                self.rebuild_sidebar();
+                self.flash(if self.show_archived.get() { "showing handed-off tasks" } else { "hiding handed-off tasks" });
+            }
+            Action::Sidebar => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
+        }
     }
 
     fn close_picker(self: &Rc<Self>) {
@@ -3003,7 +3101,33 @@ impl App {
         let mode = std::mem::replace(&mut *self.picker.mode.borrow_mut(), PickerMode::Closed);
         match mode {
             PickerMode::Closed => {}
-            PickerMode::Help => self.close_picker(),
+            PickerMode::Help => {
+                let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+                let action = self.picker.actions.borrow().get(idx).map(|&i| ACTIONS[i].2);
+                self.close_picker();
+                if let Some(action) = action {
+                    self.run_action(action);
+                }
+            }
+            PickerMode::RenameProject(pid) => {
+                if !text.is_empty() {
+                    let mut state = self.state.borrow_mut();
+                    if let Some(p) = state.project_mut(&pid) {
+                        // The default notes folder is named after the
+                        // project; pin it so renaming does not lose notes.
+                        if p.notes.is_none() {
+                            p.notes = Some(p.notes_dir());
+                        }
+                        p.name = text;
+                    }
+                    state.save();
+                    drop(state);
+                    self.rebuild_sidebar();
+                    self.update_header();
+                    self.show_project(&pid);
+                }
+                self.close_picker();
+            }
             PickerMode::Accounts => {
                 *self.picker.mode.borrow_mut() = PickerMode::Accounts;
                 self.sign_in_picked(false);
@@ -3135,6 +3259,7 @@ impl Picker {
             isolate: Cell::new(None),
             past: RefCell::default(),
             add_choices: RefCell::default(),
+            actions: RefCell::default(),
         }
     }
 
