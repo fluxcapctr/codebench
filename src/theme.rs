@@ -185,6 +185,8 @@ paned > separator:focus, paned > separator:hover {{ background: {muted}; box-sha
 .cb-page {{ padding: 0 16px 16px; background: transparent; }}
 .cb-page > row {{ padding: 6px 8px; }}
 .cb-new {{ margin-top: 6px; }}
+textview.cb-editor, textview.cb-editor text {{ background: {bg}; color: {fg}; caret-color: {accent}; }}
+textview.cb-editor text selection {{ background: {selection}; }}
 .cb-picker {{ background: {dark}; border: 1px solid {accent}; padding: 10px; }}
 .cb-picker-title {{ color: {accent}; font-weight: bold; margin-bottom: 6px; }}
 .cb-picker entry {{ background: {bg}; color: {fg}; border: 1px solid {muted}; padding: 4px 8px; min-height: 0; caret-color: {accent}; outline: none; }}

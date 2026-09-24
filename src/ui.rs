@@ -488,6 +488,13 @@ struct App {
     page_title: gtk::Label,
     page_list: gtk::ListBox,
     page_items: RefCell<Vec<PageItem>>,
+    editor: gtk::TextView,
+    /// The file open in the notes editor.
+    editor_path: RefCell<Option<PathBuf>>,
+    /// Bumped on every edit; a save runs once typing pauses.
+    editor_gen: Cell<u32>,
+    /// Set while loading a file, so loading is not taken as an edit.
+    editor_loading: Cell<bool>,
     /// The task you last looked at in each project, reopened with its tab.
     last_task: RefCell<HashMap<String, String>>,
     /// A handle on the app itself, for widgets built outside Rc methods.
@@ -711,6 +718,23 @@ impl App {
         page_scroll.set_child(Some(&page_box));
         stack.add_named(&page_scroll, Some("page"));
 
+        // The notes editor: plain text, saved as you type.
+        let editor = gtk::TextView::new();
+        editor.set_wrap_mode(gtk::WrapMode::WordChar);
+        editor.set_monospace(true);
+        editor.add_css_class("cb-editor");
+        editor.set_left_margin(24);
+        editor.set_right_margin(24);
+        editor.set_top_margin(16);
+        editor.set_bottom_margin(16);
+        let buffer = editor.buffer();
+        buffer.create_tag(Some("heading"), &[("weight", &700i32)]);
+        buffer.create_tag(Some("mark"), &[]);
+        let editor_scroll = gtk::ScrolledWindow::new();
+        editor_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        editor_scroll.set_child(Some(&editor));
+        stack.add_named(&editor_scroll, Some("editor"));
+
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
 
@@ -805,6 +829,10 @@ impl App {
             page_title,
             page_list,
             page_items: RefCell::default(),
+            editor,
+            editor_path: RefCell::default(),
+            editor_gen: Cell::new(0),
+            editor_loading: Cell::new(false),
             last_task: RefCell::default(),
             me: RefCell::default(),
             board,
@@ -942,6 +970,22 @@ impl App {
             }
         });
         self.page_list.add_controller(page_keys);
+
+        let b = self.clone();
+        self.editor.buffer().connect_changed(move |buf| {
+            b.highlight_markdown(buf);
+            if b.editor_loading.get() {
+                return;
+            }
+            let generation = b.editor_gen.get().wrapping_add(1);
+            b.editor_gen.set(generation);
+            let b2 = b.clone();
+            glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                if b2.editor_gen.get() == generation {
+                    b2.save_editor();
+                }
+            });
+        });
 
         // Drop files on the notes or artifacts view to copy them in.
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
@@ -1115,7 +1159,7 @@ impl App {
             if transient(&key) {
                 return self.current_project.borrow().clone().map(Row::Project);
             }
-            if key.starts_with("page:") {
+            if key.starts_with("page:") || key.starts_with("note:") {
                 return self.current_project.borrow().clone().map(Row::Project);
             }
             return Some(match key.strip_prefix("notes:") {
@@ -1576,7 +1620,7 @@ impl App {
         } else {
             PageItem { markup: "link these notes into your Obsidian vault".into(), act: Some(PageAct::LinkNotes), alt: None }
         });
-        self.show_page(pid, View::Notes, &format!("enter opens in your editor · {}", tilde(&dir)), items);
+        self.show_page(pid, View::Notes, &format!("enter opens it · saves as you type · {}", tilde(&dir)), items);
     }
 
     fn show_workflows_page(self: &Rc<Self>, pid: &str) {
@@ -3218,7 +3262,79 @@ impl App {
 
     /// Opens a file in the editor in its own pane; the pane closes when the
     /// editor exits.
+    /// Opens a note or workflow in the built-in editor: type, it saves as
+    /// you go, Esc goes back.
     fn edit_file(self: &Rc<Self>, project: &store::Project, path: &Path) {
+        self.save_editor();
+        *self.return_to.borrow_mut() = self.selected_row();
+        *self.current_project.borrow_mut() = Some(project.id.clone());
+        *self.current_key.borrow_mut() = Some(format!("note:{}", path.display()));
+        *self.editor_path.borrow_mut() = Some(path.to_path_buf());
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        self.editor_loading.set(true);
+        let buffer = self.editor.buffer();
+        buffer.set_text(&text);
+        buffer.place_cursor(&buffer.end_iter());
+        self.editor_loading.set(false);
+        self.stack.set_visible_child_name("editor");
+        self.editor.grab_focus();
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>{}</b></span>  <span foreground='{}'>›</span>  {}",
+            self.theme.borrow().accent,
+            esc(&project.name),
+            self.theme.borrow().muted,
+            esc(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        ));
+        self.header_right.set_text("saves as you type · esc back · ^O open in your editor");
+    }
+
+    /// Writes the editor's text to its file if it changed.
+    fn save_editor(&self) {
+        let Some(path) = self.editor_path.borrow().clone() else { return };
+        let buffer = self.editor.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let tmp = path.with_extension("md.tmp");
+        if std::fs::write(&tmp, &text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Light markdown: headings in bold accent, list markers in accent.
+    fn highlight_markdown(&self, buffer: &gtk::TextBuffer) {
+        let table = buffer.tag_table();
+        let theme = self.theme.borrow();
+        if let Some(t) = table.lookup("heading") {
+            t.set_foreground(Some(&theme.accent));
+        }
+        if let Some(t) = table.lookup("mark") {
+            t.set_foreground(Some(&theme.accent));
+        }
+        drop(theme);
+        buffer.remove_all_tags(&buffer.start_iter(), &buffer.end_iter());
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+        for (i, line) in text.lines().enumerate() {
+            let Some(start) = buffer.iter_at_line(i as i32) else { continue };
+            let trimmed = line.trim_start();
+            let indent = (line.len() - trimmed.len()) as i32;
+            if trimmed.starts_with('#') {
+                let mut end = start;
+                end.forward_to_line_end();
+                buffer.apply_tag_by_name("heading", &start, &end);
+            } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("- [") {
+                let mut a = start;
+                a.forward_chars(indent);
+                let mut b = a;
+                b.forward_chars(if trimmed.starts_with("- [") { 5 } else { 1 });
+                buffer.apply_tag_by_name("mark", &a, &b);
+            }
+        }
+    }
+
+    /// The old way: the file in your terminal editor.
+    fn edit_in_terminal(self: &Rc<Self>, project: &store::Project, path: &Path) {
         let key = format!("edit:{}", path.display());
         *self.return_to.borrow_mut() = self.selected_row();
         *self.current_project.borrow_mut() = Some(project.id.clone());
@@ -3395,6 +3511,31 @@ impl App {
         let alt = mods.contains(gdk::ModifierType::ALT_MASK);
         let key = key.to_lower();
 
+        let in_editor = self.current_key.borrow().as_deref().is_some_and(|k| k.starts_with("note:"));
+        if in_editor && key == gdk::Key::Escape && !ctrl && !alt && !shift {
+            self.save_editor();
+            *self.editor_path.borrow_mut() = None;
+            // Back to the list it was opened from.
+            match self.view.get() {
+                v @ (View::Notes | View::Workflows) => self.show_view(v),
+                _ => self.go_back(),
+            }
+            return glib::Propagation::Stop;
+        }
+        if in_editor && ctrl && !shift && !alt && key == gdk::Key::o {
+            self.save_editor();
+            let path = self.editor_path.borrow_mut().take();
+            let project = self.current_project.borrow().clone().and_then(|pid| self.state.borrow().project(&pid).cloned());
+            if let (Some(path), Some(p)) = (path, project) {
+                self.edit_in_terminal(&p, &path);
+            }
+            return glib::Propagation::Stop;
+        }
+        if in_editor && ctrl && !shift && !alt && key == gdk::Key::s {
+            self.save_editor();
+            self.flash("saved");
+            return glib::Propagation::Stop;
+        }
         if key == gdk::Key::F1 && !ctrl && !alt {
             self.open_help();
             return glib::Propagation::Stop;

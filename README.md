@@ -74,7 +74,8 @@ processes. The sidebar lists the project's tasks (`Alt+↑/↓`). Switching
 back to a tab reopens the task you had open there.
 
 - **notes** lists the brief, your own notes (+ new note), handoffs and
-  workflow runs; Enter opens one in your editor.
+  workflow runs. Enter opens one in a plain built-in editor that saves as
+  you type; Esc goes back, `Ctrl+O` opens it in your terminal editor instead.
 - **workflows** runs a workflow (Enter) or edits it (`e`).
 - **processes** shows servers started from the project's folders, like a
   dev server an agent left running: Enter opens it in the browser, `x`
