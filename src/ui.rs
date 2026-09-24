@@ -44,6 +44,18 @@ enum View {
 impl View {
     const ALL: [View; 7] = [View::Tasks, View::Files, View::Notes, View::Workflows, View::Artifacts, View::Git, View::Processes];
 
+    fn glyph(self) -> &'static str {
+        match self {
+            View::Tasks => "●",
+            View::Files => "▤",
+            View::Notes => "≡",
+            View::Workflows => "▶",
+            View::Artifacts => "◆",
+            View::Git => "±",
+            View::Processes => "⚙\u{fe0e}",
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             View::Tasks => "tasks",
@@ -635,8 +647,9 @@ impl App {
         let mut view_buttons = Vec::new();
         for (i, v) in View::ALL.iter().enumerate() {
             let l = gtk::Label::new(None);
-            l.set_markup(&format!("<span alpha='50%'>{}</span> {}", i + 1, v.name()));
+            l.set_markup(&format!("{} {}", v.glyph(), v.name()));
             let b = gtk::Button::new();
+            b.set_tooltip_text(Some(&format!("Alt+{}", i + 1)));
             b.set_child(Some(&l));
             b.set_has_frame(false);
             b.set_focus_on_click(false);
@@ -1175,7 +1188,8 @@ impl App {
                 _ => String::new(),
             };
             if let Some(l) = button.child().and_downcast::<gtk::Label>() {
-                l.set_markup(&format!("<span alpha='50%'>{}</span> {}{extra}", i + 1, view.name()));
+                let _ = i;
+                l.set_markup(&format!("{} {}{extra}", view.glyph(), view.name()));
             }
         }
 

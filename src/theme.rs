@@ -157,7 +157,7 @@ window, .cb-root {{ background: {bg}; color: {fg}; }}
 .cb-sidebar {{ background: {dark}; border-right: 1px solid {muted}; }}
 .cb-brand {{ color: {accent}; font-weight: bold; padding: 10px 12px 6px 12px; }}
 list, list > row {{ background: transparent; color: {fg}; }}
-list > row {{ padding: 2px 12px; min-height: 0; outline: none; }}
+list > row {{ padding: 6px 12px; min-height: 0; outline: none; }}
 list > row:hover {{ background: alpha({light}, 0.6); }}
 list > row:selected {{ background: {selection}; color: {fg}; }}
 list > row:selected label {{ color: {fg}; }}
@@ -174,12 +174,12 @@ paned > separator {{ background: {muted}; min-width: 1px; }}
 .cb-root > separator, .cb-root > separator:hover, .cb-root > separator:focus, .cb-root > separator:backdrop {{ background: {muted}; min-width: 1px; box-shadow: none; outline: none; }}
 paned > separator:focus, paned > separator:hover {{ background: {muted}; box-shadow: none; outline: none; }}
 .cb-tabs {{ background: {dark}; border-bottom: 1px solid {muted}; padding: 0 4px; }}
-.cb-tab {{ padding: 4px 12px; min-height: 0; color: {muted}; background: transparent; border-bottom: 2px solid transparent; }}
+.cb-tab {{ padding: 8px 14px; min-height: 0; color: {muted}; background: transparent; border-bottom: 2px solid transparent; }}
 .cb-tab:hover {{ color: {fg}; background: alpha({light}, 0.6); }}
 .cb-tab.active {{ color: {fg}; background: {bg}; border-bottom-color: {accent}; }}
-.cb-views {{ background: {bg}; border-bottom: 1px solid {muted}; padding: 0 4px; }}
-.cb-view {{ padding: 3px 12px; min-height: 0; color: {muted}; background: transparent; border-bottom: 2px solid transparent; }}
-.cb-view:hover {{ color: {fg}; }}
+.cb-views {{ background: {bg}; border-bottom: 1px solid {muted}; padding: 2px 4px; }}
+.cb-view {{ padding: 7px 14px; min-height: 0; color: {fg}; background: transparent; border-bottom: 2px solid transparent; }}
+.cb-view:hover {{ color: {accent}; background: alpha({light}, 0.6); }}
 .cb-view.active {{ color: {accent}; border-bottom-color: {accent}; }}
 .cb-page-title {{ padding: 16px 24px 8px; }}
 .cb-page {{ padding: 0 16px 16px; background: transparent; }}
