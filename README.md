@@ -40,6 +40,7 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+P` | Workflows: run one, edit it (`Ctrl+E`), or type a name to create one |
 | `Ctrl+Shift+E` | Edit the project's notes in `$EDITOR` |
 | `Ctrl+Shift+G` | Git (lazygit) for the task's folder or the project; `q` returns |
+| `Ctrl+Shift+F` | Browse files (yazi if installed, else your editor) in the task's folder |
 | `Ctrl+Shift+M` | Merge a worktree task back (press twice) |
 | `Tab` | In the new task box: give the task its own git worktree |
 | `Ctrl+Shift+H` | Hand off: the agent writes a note, the task continues in a fresh session |
@@ -56,7 +57,7 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+Y` | Phone access: on or off, its address, paired phones |
 | `Ctrl+Shift+S` | Split: pin this task on the right, pick another for the left; again to unpin |
 | `Ctrl+Shift+←/→` | Focus the left or right side of a split |
-| `Ctrl+Shift+B` | Toggle the sidebar |
+| `Ctrl+Shift+B` | Toggle the sidebar (drag its edge to resize) |
 | `Ctrl+Shift+C/V` | Copy and paste |
 | `Alt+Up/Down` | Move through projects, notes and tasks |
 | `F1` | All commands: type to filter, Enter runs one |

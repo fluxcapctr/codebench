@@ -52,6 +52,7 @@ enum Action {
     Delete,
     Archived,
     Sidebar,
+    Files,
 }
 
 const ACTIONS: &[(&str, &str, Action)] = &[
@@ -67,6 +68,7 @@ const ACTIONS: &[(&str, &str, Action)] = &[
     ("Ctrl+Shift+J", "open the brief in Obsidian", Action::Obsidian),
     ("Ctrl+Shift+R", "rename the task or project", Action::Rename),
     ("Ctrl+Shift+G", "git (lazygit) for this task or project", Action::Git),
+    ("Ctrl+Shift+F", "browse files (yazi, or your editor) in this task's folder", Action::Files),
     ("Ctrl+Shift+M", "merge a worktree task back into its branch (press twice)", Action::Merge),
     ("Ctrl+Shift+K", "give this project's agents a browser (on or off)", Action::Browser),
     ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left", Action::Split),
@@ -182,6 +184,24 @@ fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<stor
     let path = store::data_dir().join("worktrees").join(format!("{}-{slug}-{short}", project.name));
     let base = git::add_worktree(&project.path, &path, &branch)?;
     Ok(store::Worktree { path, branch, base })
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct UiSettings {
+    sidebar_width: i32,
+}
+
+fn ui_settings() -> UiSettings {
+    std::fs::read(store::config_dir().join("ui.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(UiSettings { sidebar_width: 270 })
+}
+
+fn save_ui_settings(s: &UiSettings) {
+    if let Ok(json) = serde_json::to_vec(s) {
+        let _ = std::fs::write(store::config_dir().join("ui.json"), json);
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -505,12 +525,16 @@ impl App {
         // No client-side titlebar: Hyprland draws the border, like a terminal.
         window.set_decorated(false);
 
-        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        // The sidebar and the main area, with a draggable divider.
+        let root = gtk::Paned::new(gtk::Orientation::Horizontal);
         root.add_css_class("cb-root");
+        root.set_wide_handle(false);
+        root.set_shrink_start_child(false);
+        root.set_resize_start_child(false);
 
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_box.add_css_class("cb-sidebar");
-        sidebar_box.set_width_request(270);
+        sidebar_box.set_width_request(160);
         let brand = label("cb-brand");
         brand.set_text("codebench");
         let sidebar = gtk::ListBox::new();
@@ -610,8 +634,15 @@ impl App {
         main.append(&header);
         main.append(&paned);
         main.append(&footer);
-        root.append(&sidebar_box);
-        root.append(&main);
+        root.set_start_child(Some(&sidebar_box));
+        root.set_end_child(Some(&main));
+        root.set_position(ui_settings().sidebar_width);
+        root.connect_position_notify(|paned| {
+            let width = paned.position();
+            if width >= 160 {
+                save_ui_settings(&UiSettings { sidebar_width: width });
+            }
+        });
         window.set_child(Some(&root));
 
         let status_dir = store::cache_dir().join("status");
@@ -2438,6 +2469,34 @@ impl App {
         }
     }
 
+    /// A file manager (yazi) or your editor at the task's folder, in a pane
+    /// that closes when you quit it.
+    fn open_files(self: &Rc<Self>) {
+        let Some(dir) = self.current_dir() else {
+            self.flash("select a project first");
+            return;
+        };
+        let key = format!("edit:files:{}", dir.display());
+        *self.return_to.borrow_mut() = self.selected_row();
+        *self.current_key.borrow_mut() = Some(key.clone());
+        if !self.status_of(&key).running() {
+            let argv: Vec<String> = if agents::on_path("yazi") {
+                vec!["yazi".into()]
+            } else {
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
+                vec!["sh".into(), "-c".into(), format!("exec {editor} .")]
+            };
+            self.spawn(&key, "editor", &argv, &dir, &[]);
+        }
+        self.focus_terminal(&key);
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>files</b></span>  {}",
+            self.theme.borrow().accent,
+            esc(&tilde(&dir))
+        ));
+        self.header_right.set_text("quit to close");
+    }
+
     /// lazygit in its own pane; quitting it returns to where you were.
     fn open_git(self: &Rc<Self>, dir: &Path) {
         let key = format!("git:{}", dir.display());
@@ -2824,6 +2883,7 @@ impl App {
                 gdk::Key::n => self.open_new_task(),
                 gdk::Key::p => self.open_workflows(),
                 gdk::Key::g => self.open_git_here(),
+                gdk::Key::f => self.open_files(),
                 gdk::Key::m => self.merge_current(),
                 gdk::Key::e => self.open_notes(),
                 gdk::Key::h => self.start_handoff(),
@@ -3219,6 +3279,7 @@ impl App {
                 self.flash(if self.show_archived.get() { "showing handed-off tasks" } else { "hiding handed-off tasks" });
             }
             Action::Sidebar => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
+            Action::Files => self.open_files(),
         }
     }
 
