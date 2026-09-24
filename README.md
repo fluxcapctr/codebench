@@ -53,6 +53,7 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+D` | Delete the task, or remove the project (press twice) |
 | `Ctrl+Shift+A` | Show or hide handed-off tasks |
 | `Ctrl+Shift+K` | Give this project's agents a browser (on or off) |
+| `Ctrl+Shift+Y` | Phone access: on or off, its address, paired phones |
 | `Ctrl+Shift+S` | Split: pin this task on the right, pick another for the left; again to unpin |
 | `Ctrl+Shift+←/→` | Focus the left or right side of a split |
 | `Ctrl+Shift+B` | Toggle the sidebar |
@@ -233,6 +234,28 @@ subscriptions apply.
 - Theme: `~/.local/state/omarchy/current/theme/` (`colors.toml`, `ghostty.conf`)
 - Font: `~/.config/ghostty/config`
 
+## On your phone
+
+Codebench can serve a phone app over [Tailscale](https://tailscale.com): an
+inbox of tasks that need you, each task's conversation and live terminal
+with one-tap keys (yes, no, arrows, numbers) and a reply box, new tasks,
+workflows, your plan limits, and push notifications when a task needs you
+or finishes. It installs to the home screen.
+
+1. In the Tailscale admin console, turn on **HTTPS certificates** (DNS page).
+2. Let your user manage `tailscale serve`: `sudo tailscale set --operator=$USER`.
+3. `tailscale serve --bg 47823`, then `Ctrl+Shift+Y` in Codebench and turn
+   phone access on.
+4. On the phone (on your tailnet), open the address shown, pair it, and
+   approve the code in Codebench. Then turn on notifications in its settings.
+
+The server listens on 127.0.0.1 only; `tailscale serve` is what puts it on
+your tailnet, over HTTPS. A phone needs a token from pairing, which you
+approve on the desktop; tokens are stored hashed and can be revoked in
+`Ctrl+Shift+Y`. Requests arriving through Tailscale must come from this
+machine's Tailscale login. The phone can only talk to agent tasks, never a
+plain shell, editor, git or sign-in pane.
+
 ## Trust and safety
 
 Codebench runs agents with the permissions you already gave them; it adds no
@@ -248,5 +271,7 @@ sandbox of its own. Things worth knowing:
   says without you watching.
 - **Background runs are unattended.** `codebench schedule on` runs due
   workflows while you are away, with the agent's usual permission settings.
+- **Phone access** lets a paired phone type into your agent tasks. Only pair
+  your own phones, and revoke any you lose from `Ctrl+Shift+Y`.
 - **Local files.** Codebench's folders are created readable by you only,
   since anything that can write to them can prompt your agents.

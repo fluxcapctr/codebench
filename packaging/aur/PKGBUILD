@@ -6,13 +6,15 @@ pkgdesc="Terminal-first workspace for running coding agents across projects, sty
 arch=('x86_64')
 url="https://github.com/fluxcapctr/codebench"
 license=('MIT')
-depends=('gtk4' 'vte4' 'git' 'gcc-libs' 'glibc')
+depends=('gtk4' 'vte4' 'git' 'openssl' 'curl' 'gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=(
   'claude-code: Claude Code tasks'
   'lazygit: the git pane'
   'neovim: the notes editor when $EDITOR is unset'
   'libnotify: desktop notifications'
+  'tailscale: phone access'
+  'nodejs: the browser for agents (npx)'
 )
 provides=('codebench')
 conflicts=('codebench')
