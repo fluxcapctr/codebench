@@ -26,6 +26,9 @@ const APP_JS: &str = include_str!("phone/app.js");
 const APP_CSS: &str = include_str!("phone/app.css");
 const ICON: &str = include_str!("phone/icon.svg");
 const MANIFEST: &str = include_str!("phone/manifest.webmanifest");
+const SW_JS: &str = include_str!("phone/sw.js");
+const ICON_192: &[u8] = include_bytes!("phone/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("phone/icon-512.png");
 
 /// What the phone asks Codebench to do.
 #[derive(Debug)]
@@ -37,6 +40,8 @@ pub enum Command {
     /// Start or resume a task so its screen can be shown.
     Open { task: String },
     NewTask { project: String, agent: String, title: String, prompt: String },
+    /// Run a workflow file in a project.
+    RunWorkflow { project: String, path: std::path::PathBuf },
     /// A phone wants to pair and shows `code`; approve it on the desktop.
     PairRequest { id: String, code: String, name: String },
 }
@@ -55,6 +60,9 @@ pub struct Device {
     pub paired: u64,
     #[serde(default)]
     pub last_seen: u64,
+    /// Where to send push notifications, once the phone turned them on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<crate::push::Subscription>,
 }
 
 #[derive(Default)]
@@ -82,6 +90,7 @@ pub struct Remote {
     events: broadcast::Sender<String>,
     pub commands: async_channel::Receiver<Command>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    runtime: tokio::runtime::Handle,
 }
 
 fn devices_file() -> std::path::PathBuf {
@@ -144,11 +153,13 @@ impl Remote {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let ctx = Ctx { shared: shared.clone(), events: events.clone(), commands: tx, owner: tailscale_owner() };
 
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("codebench-remote".into())
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build();
                 let Ok(rt) = rt else { return };
+                let _ = handle_tx.send(rt.handle().clone());
                 rt.block_on(async move {
                     let Ok(listener) = tokio::net::TcpListener::from_std(listener) else { return };
                     let app = router(ctx);
@@ -161,7 +172,8 @@ impl Remote {
             })
             .map_err(|e| e.to_string())?;
 
-        Ok(Remote { shared, events, commands: rx, shutdown: Some(stop_tx) })
+        let runtime = handle_rx.recv().map_err(|_| "the server could not start".to_string())?;
+        Ok(Remote { shared, events, commands: rx, shutdown: Some(stop_tx), runtime })
     }
 
     /// The task list the phone shows; pushed to live phones when it changes.
@@ -200,12 +212,41 @@ impl Remote {
         let Some(Pairing::Pending { name, .. }) = s.pairings.get(id).cloned() else { return };
         if approve {
             let token = random_hex(32);
-            s.devices.push(Device { name, token_sha256: sha256_hex(&token), paired: now(), last_seen: now() });
+            s.devices.push(Device { name, token_sha256: sha256_hex(&token), paired: now(), last_seen: now(), push: None });
             save_devices(&s.devices);
             s.pairings.insert(id.to_string(), Pairing::Approved { token });
         } else {
             s.pairings.insert(id.to_string(), Pairing::Denied);
         }
+    }
+
+    /// Pushes a notification to every phone that turned them on, dropping
+    /// subscriptions the push service says are gone.
+    pub fn notify(&self, title: &str, body: &str, task: &str) {
+        let subs: Vec<(String, crate::push::Subscription)> = self
+            .shared
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .filter_map(|d| d.push.clone().map(|p| (d.token_sha256.clone(), p)))
+            .collect();
+        if subs.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({ "title": title, "body": body, "task": task, "url": format!("/#/task/{task}") });
+        let shared = self.shared.clone();
+        self.runtime.spawn(async move {
+            for (device, sub) in subs {
+                if let crate::push::Sent::Gone = crate::push::send(&sub, &payload).await {
+                    let mut s = shared.lock().unwrap();
+                    if let Some(d) = s.devices.iter_mut().find(|d| d.token_sha256 == device) {
+                        d.push = None;
+                    }
+                    save_devices(&s.devices);
+                }
+            }
+        });
     }
 
     pub fn devices(&self) -> Vec<Device> {
@@ -235,6 +276,12 @@ fn router(ctx: Ctx) -> Router {
         .route("/app.css", get(|| async { page(APP_CSS, "text/css; charset=utf-8") }))
         .route("/icon.svg", get(|| async { page(ICON, "image/svg+xml") }))
         .route("/manifest.webmanifest", get(|| async { page(MANIFEST, "application/manifest+json") }))
+        .route("/sw.js", get(|| async { page(SW_JS, "text/javascript; charset=utf-8") }))
+        .route("/icon-192.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], ICON_192).into_response() }))
+        .route("/icon-512.png", get(|| async { ([(header::CONTENT_TYPE, "image/png")], ICON_512).into_response() }))
+        .route("/api/push/key", get(push_key))
+        .route("/api/push/subscribe", post(push_subscribe))
+        .route("/api/push/test", post(push_test))
         .route("/theme.css", get(theme_css))
         .route("/api/pair", post(pair_start))
         .route("/api/pair/{id}", get(pair_status))
@@ -244,6 +291,9 @@ fn router(ctx: Ctx) -> Router {
         .route("/api/task/{id}/keys", post(keys))
         .route("/api/task/{id}/open", post(open))
         .route("/api/tasks", post(new_task))
+        .route("/api/task/{id}/chat", get(chat))
+        .route("/api/workflows/{project}", get(workflows))
+        .route("/api/workflows/{project}/run", post(run_workflow))
         .route("/api/live", get(live))
         .with_state(ctx)
 }
@@ -279,6 +329,13 @@ fn tailnet_ok(ctx: &Ctx, headers: &HeaderMap) -> bool {
         (Some(_), None) => false,
         (None, _) => true,
     }
+}
+
+/// The device a valid token belongs to, by token hash.
+fn device_of(ctx: &Ctx, headers: &HeaderMap) -> Option<String> {
+    let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
+    let hash = sha256_hex(token);
+    ctx.shared.lock().unwrap().devices.iter().any(|d| d.token_sha256 == hash).then_some(hash)
 }
 
 fn token_ok(ctx: &Ctx, token: &str) -> bool {
@@ -433,6 +490,122 @@ async fn new_task(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<NewT
         .commands
         .send(Command::NewTask { project: b.project, agent: b.agent, title: b.title, prompt: b.prompt })
         .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn push_key(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    match tokio::task::spawn_blocking(crate::push::public_key).await {
+        Ok(Ok(key)) => Json(serde_json::json!({ "key": key })).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Deserialize)]
+struct PushBody {
+    endpoint: String,
+    keys: PushKeys,
+}
+
+async fn push_subscribe(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<PushBody>) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    // Push services are https; anything else is not a real subscription.
+    if !b.endpoint.starts_with("https://") || b.endpoint.len() > 2048 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(device) = device_of(&ctx, &headers) else { return StatusCode::UNAUTHORIZED.into_response() };
+    let mut s = ctx.shared.lock().unwrap();
+    if let Some(d) = s.devices.iter_mut().find(|d| d.token_sha256 == device) {
+        d.push = Some(crate::push::Subscription { endpoint: b.endpoint, p256dh: b.keys.p256dh, auth: b.keys.auth });
+    }
+    save_devices(&s.devices);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn push_test(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    let Some(device) = device_of(&ctx, &headers) else { return StatusCode::UNAUTHORIZED.into_response() };
+    let sub = ctx.shared.lock().unwrap().devices.iter().find(|d| d.token_sha256 == device).and_then(|d| d.push.clone());
+    let Some(sub) = sub else { return (StatusCode::BAD_REQUEST, "notifications are not on for this phone").into_response() };
+    let payload = serde_json::json!({ "title": "codebench", "body": "Notifications work.", "url": "/" });
+    match crate::push::send(&sub, &payload).await {
+        crate::push::Sent::Ok => StatusCode::NO_CONTENT.into_response(),
+        crate::push::Sent::Gone => (StatusCode::GONE, "the phone's subscription expired; turn notifications on again").into_response(),
+        crate::push::Sent::Failed(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// The conversation as messages, for Claude and Codex tasks. Read straight
+/// from their session files, so it works whether or not the task runs.
+async fn chat(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    let entries = tokio::task::spawn_blocking(move || {
+        let state = crate::store::State::load();
+        let (_, session) = state.session(&id)?;
+        match session.agent.as_str() {
+            "claude" => Some(crate::chat::claude(&crate::agents::claude_transcript(&session.id)?, 80)),
+            "codex" => Some(crate::chat::codex(&crate::agents::codex_rollout(session)?, 80)),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    match entries {
+        Some(e) => Json(serde_json::json!({ "entries": e })).into_response(),
+        None => Json(serde_json::json!({ "entries": [], "unsupported": true })).into_response(),
+    }
+}
+
+async fn workflows(State(ctx): State<Ctx>, headers: HeaderMap, Path(project): Path<String>) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    let list = tokio::task::spawn_blocking(move || {
+        let state = crate::store::State::load();
+        let p = state.project(&project)?;
+        Some(
+            crate::workflow::list(p)
+                .into_iter()
+                .map(|w| serde_json::json!({
+                    "name": w.name, "agent": w.agent, "path": w.path,
+                    "schedule": w.schedule_text, "from": w.collection.or(if w.global { Some("global".into()) } else { None }),
+                }))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    Json(serde_json::json!({ "workflows": list })).into_response()
+}
+
+#[derive(Deserialize)]
+struct RunBody {
+    path: std::path::PathBuf,
+}
+
+async fn run_workflow(State(ctx): State<Ctx>, headers: HeaderMap, Path(project): Path<String>, Json(b): Json<RunBody>) -> Response {
+    if let Err(code) = authorized(&ctx, &headers) {
+        return code.into_response();
+    }
+    let _ = ctx.commands.send(Command::RunWorkflow { project, path: b.path }).await;
     StatusCode::NO_CONTENT.into_response()
 }
 

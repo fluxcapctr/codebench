@@ -1,6 +1,7 @@
 mod accounts;
 mod agents;
 mod bus;
+mod chat;
 mod git;
 mod headless;
 mod history;
@@ -8,6 +9,7 @@ mod mcp;
 mod limits;
 mod notes;
 mod progress;
+mod push;
 mod remote;
 mod store;
 mod theme;

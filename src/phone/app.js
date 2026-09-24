@@ -7,12 +7,18 @@ const view = $("#view");
 const title = $("#title");
 const back = $("#back");
 const conn = $("#conn");
+const gear = $("#gear");
+let installPrompt = null;
+window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); installPrompt = e; });
+gear.addEventListener("click", () => go("#/settings"));
 
 let token = localStorage.getItem("cb.token") || "";
 let state = null;
 let socket = null;
 let watching = null;
 let fit = localStorage.getItem("cb.fit") !== "off";
+let tab = "chat";
+let chatTimer = null;
 
 // ---------------------------------------------------------------- helpers
 
@@ -107,7 +113,7 @@ function connect() {
     const msg = JSON.parse(e.data);
     if (msg.type === "unauthorized" || msg.type === "revoked") { forget(); return; }
     if (msg.type === "state") { state = msg.data; render(); }
-    if (msg.type === "screen" && msg.task === watching) showScreen(msg.html);
+    if (msg.type === "screen" && msg.task === watching) { showScreen(msg.html); refreshChatSoon(); }
     if (msg.type === "theme") reloadTheme();
   };
   socket.onclose = () => {
@@ -137,6 +143,7 @@ function render() {
   if (route === "task" && arg) return taskView(decodeURIComponent(arg));
   if (route === "new") return newView(arg ? decodeURIComponent(arg) : "");
   if (route === "pair") return token ? go("#/") : pairView();
+  if (route === "settings") return settingsView();
   return inboxView();
 }
 
@@ -207,6 +214,58 @@ async function keys(task, list) {
   catch (e) { toast(e.message); }
 }
 
+// Just enough markdown for agent replies: ``` blocks, `code` and **bold**.
+// Built as DOM nodes, never as HTML.
+function renderText(text) {
+  const out = [];
+  const parts = text.split(/```[a-zA-Z0-9_-]*\n?/);
+  parts.forEach((part, i) => {
+    if (i % 2 === 1) { out.push(h("pre", { class: "code" }, part.replace(/\n$/, ""))); return; }
+    for (const piece of part.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/)) {
+      if (!piece) continue;
+      if (piece.startsWith("`") && piece.endsWith("`") && piece.length > 2) out.push(h("code", {}, piece.slice(1, -1)));
+      else if (piece.startsWith("**") && piece.endsWith("**") && piece.length > 4) out.push(h("b", {}, piece.slice(2, -2)));
+      else out.push(piece);
+    }
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------- chat
+
+function hasChat(t) { return t && (t.agent === "claude" || t.agent === "codex"); }
+
+function refreshChatSoon() {
+  if (tab !== "chat" || chatTimer) return;
+  chatTimer = setTimeout(() => { chatTimer = null; loadChat(); }, 1500);
+}
+
+async function loadChat() {
+  const box = $(".chat");
+  if (!box || !watching) return;
+  let r;
+  try { r = await api(`/api/task/${encodeURIComponent(watching)}/chat`); } catch (e) { return; }
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  if (!r.entries.length) {
+    box.replaceChildren(h("div", { class: "empty" }, r.unsupported ? "no chat view for this agent. see screen" : "no messages yet"));
+    return;
+  }
+  box.replaceChildren(...r.entries.map(e => e.role === "tool"
+    ? h("div", { class: "tool" }, "▸ " + e.text)
+    : h("div", { class: "msg " + e.role }, ...renderText(e.text))));
+  if (atBottom || !box.dataset.loaded) box.scrollTop = box.scrollHeight;
+  box.dataset.loaded = "1";
+}
+
+function setTab(which) {
+  tab = which;
+  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === which));
+  $(".chat").hidden = which !== "chat";
+  $(".screen").hidden = which !== "screen";
+  if (which === "chat") loadChat();
+  else api(`/api/task/${encodeURIComponent(watching)}/screen`).then(r => showScreen(r.html));
+}
+
 function statusParts(id, p, t) {
   const [glyph, color, word] = LOOK[t?.kind] || LOOK.idle;
   const toggle = () => {
@@ -255,14 +314,21 @@ function taskView(id) {
   };
   const k = (label, list, cls) => h("button", { class: cls || "", onclick: () => keys(id, list) }, label);
   const screen = h("div", { class: "screen" + (fit ? " fit" : "") }, h("pre", { class: "dim" }, "loading screen…"));
+  const chat = h("div", { class: "chat" }, h("div", { class: "empty" }, "loading…"));
+  tab = hasChat(t) ? "chat" : "screen";
   view.replaceChildren(h("div", { class: "task", "data-id": id },
     h("div", { class: "status" }, ...statusParts(id, p, t)),
+    hasChat(t) ? h("div", { class: "tabs" },
+      h("button", { "data-tab": "chat", onclick: () => setTab("chat") }, "chat"),
+      h("button", { "data-tab": "screen", onclick: () => setTab("screen") }, "screen")) : null,
+    chat,
     screen,
     h("div", { class: "keys" },
       k("yes ✓", ["enter"], "ok"), k("no ✗", ["esc"], "no"), k("↑", ["up"]), k("↓", ["down"]), k("1", ["1"]), k("2", ["2"]),
       k("tab", ["tab"]), k("⇧tab", ["shift-tab"]), k("⏎", ["enter"]), k("esc", ["esc"]), k("3", ["3"]), k("^C", ["ctrl-c"])),
     h("div", { class: "reply" }, reply, h("button", { class: "primary", onclick: sendReply }, "send"))));
   api(`/api/task/${encodeURIComponent(id)}/screen`).then(r => showScreen(r.html)).catch(e => toast(e.message));
+  setTab(tab);
 }
 
 // ---------------------------------------------------------------- new task
@@ -276,6 +342,30 @@ function newView(pid) {
   const agent = h("select", {}, (state?.agents || ["claude"]).map(a => h("option", { value: a }, a)));
   const name = h("input", { placeholder: "task name (optional)" });
   const prompt = h("textarea", { placeholder: "what should the agent do?" });
+  const flows = h("div", {});
+  const loadFlows = async () => {
+    flows.replaceChildren();
+    let r;
+    try { r = await api(`/api/workflows/${encodeURIComponent(project.value)}`); } catch (e) { return; }
+    if (!r.workflows.length) return;
+    flows.append(h("div", { class: "section" }, "or run a workflow"));
+    for (const w of r.workflows) {
+      flows.append(h("div", { class: "row", onclick: async () => {
+        if (!confirm(`Run "${w.name}" in ${project.selectedOptions[0].textContent}?`)) return;
+        try {
+          await api(`/api/workflows/${encodeURIComponent(project.value)}/run`, { path: w.path });
+          toast("workflow started");
+          go("#/");
+        } catch (e) { toast(e.message); }
+      } },
+        h("span", { class: "glyph accent" }, "▶"),
+        h("div", { class: "main" },
+          h("div", { class: "t" }, w.name),
+          h("div", { class: "s" }, [w.agent, w.schedule, w.from].filter(Boolean).join(" · ")))));
+    }
+  };
+  project.addEventListener("change", loadFlows);
+  loadFlows();
   view.replaceChildren(h("div", { class: "form" },
     h("label", {}, "project", project),
     h("label", {}, "agent", agent),
@@ -288,7 +378,55 @@ function newView(pid) {
         toast("started");
         go("#/");
       } catch (e) { toast(e.message); }
-    } }, "start task")));
+    } }, "start task")), flows);
+}
+
+// ---------------------------------------------------------------- settings
+
+function b64ToBytes(b64) {
+  const s = atob(b64.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - b64.length % 4) % 4));
+  return Uint8Array.from(s, c => c.charCodeAt(0));
+}
+
+async function pushStatus() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return "not supported in this browser";
+  if (!window.isSecureContext) return "needs the https address (tailscale serve)";
+  if (Notification.permission === "denied") return "blocked in the browser's site settings";
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  return sub ? "on" : "off";
+}
+
+async function turnOnPush() {
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast("notifications not allowed"); return; }
+  const reg = await navigator.serviceWorker.ready;
+  const { key } = await api("/api/push/key");
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+  await api("/api/push/subscribe", sub.toJSON());
+  toast("notifications on");
+}
+
+async function settingsView() {
+  watching = null;
+  back.hidden = false;
+  title.textContent = "settings";
+  const status = h("span", { class: "accent" }, "…");
+  const standalone = matchMedia("(display-mode: standalone)").matches;
+  view.replaceChildren(h("div", { class: "form" },
+    h("div", { class: "section", style: "padding:0" }, "notifications"),
+    h("div", {}, "Tasks that need you or finish: ", status),
+    h("button", { class: "primary", onclick: async () => {
+      try { await turnOnPush(); status.textContent = await pushStatus(); } catch (e) { toast(e.message); }
+    } }, "turn on notifications"),
+    h("button", { onclick: () => api("/api/push/test", {}).then(() => toast("sent. it should arrive in a moment")).catch(e => toast(e.message)) }, "send a test notification"),
+    h("div", { class: "section", style: "padding:0" }, "app"),
+    standalone ? h("div", { class: "dim" }, "Installed on the home screen.")
+      : installPrompt ? h("button", { onclick: async () => { installPrompt.prompt(); installPrompt = null; } }, "install on home screen")
+      : h("div", { class: "dim" }, "To install: Chrome menu ⋮ → Add to Home screen."),
+    h("div", { class: "section", style: "padding:0" }, "this phone"),
+    h("button", { onclick: () => { if (confirm("Forget this phone? You will need to pair again.")) forget(); } }, "forget this phone")));
+  status.textContent = await pushStatus().catch(e => e.message);
 }
 
 // ---------------------------------------------------------------- pairing
@@ -333,6 +471,7 @@ async function startPairing(name) {
 
 // ---------------------------------------------------------------- start
 
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 render();
 connect();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) connect(); });

@@ -1566,6 +1566,13 @@ impl App {
         if status.wants_attention() && !visible {
             self.notify(key, status);
         }
+        if status.wants_attention()
+            && let Some(remote) = self.remote.borrow().as_ref()
+            && let Some((p, s)) = self.state.borrow().session(key)
+        {
+            let body = if status == Status::Waiting { "needs you" } else { "finished" };
+            remote.notify(&format!("{} · {}", p.name, s.title), body, key);
+        }
         if status.free() {
             self.deliver_inbox(key);
         }
@@ -2116,6 +2123,16 @@ impl App {
                 }
                 let b = self.clone();
                 glib::timeout_add_local_once(Duration::from_millis(600), move || b.send_screen(&task));
+            }
+            remote::Command::RunWorkflow { project, path } => {
+                // Only a workflow the project actually lists, never an
+                // arbitrary file.
+                let Some(p) = self.state.borrow().project(&project).cloned() else { return };
+                let wf = workflow::list(&p).into_iter().find(|w| w.path == path);
+                if let Some(wf) = wf {
+                    self.run_workflow(&project, &wf, false);
+                    self.flash(&format!("phone started workflow: {}", wf.name));
+                }
             }
             remote::Command::NewTask { project, agent, title, prompt } => {
                 if agents::get(&agent).is_none_or(|a| a.id == "shell") || !agents::installed().iter().any(|a| a.id == agent) {
