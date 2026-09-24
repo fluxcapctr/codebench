@@ -59,8 +59,25 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+←/→` | Focus the left or right side of a split |
 | `Ctrl+Shift+B` | Toggle the sidebar (drag its edge to resize) |
 | `Ctrl+Shift+C/V` | Copy and paste |
-| `Alt+Up/Down` | Move through projects, notes and tasks |
+| `Ctrl+1…9`, `Ctrl+PgUp/PgDn` | Switch project tab |
+| `Alt+1…7` | Views: tasks, files, notes, workflows, artifacts, git, processes |
+| `Alt+Up/Down` | Move through the project's tasks |
 | `F1` | All commands: type to filter, Enter runs one |
+
+## Layout
+
+Projects are **tabs** across the top (`Ctrl+1…9`, `Ctrl+PgUp/PgDn`); each
+shows how many of its tasks need you. Under them, the current project's
+**views** (`Alt+1…7`): tasks, files, notes, workflows, artifacts, git and
+processes. The sidebar lists the project's tasks (`Alt+↑/↓`). Switching
+back to a tab reopens the task you had open there.
+
+- **notes** lists the brief, your own notes (+ new note), handoffs and
+  workflow runs; Enter opens one in your editor.
+- **workflows** runs a workflow (Enter) or edits it (`e`).
+- **processes** shows servers started from the project's folders, like a
+  dev server an agent left running: Enter opens it in the browser, `x`
+  stops it.
 
 ## Project board
 

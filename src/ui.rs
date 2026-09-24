@@ -27,7 +27,58 @@ use vte::prelude::*;
 
 pub const APP_ID: &str = "co.ericstevens.codebench";
 
-const HINTS: &str = "^⇧N new task   ^⇧P workflows   ^⇧G git   ^⇧E notes   ^⇧H handoff   alt ↑↓ switch   F1 all commands";
+const HINTS: &str = "^1-9 projects   alt 1-7 views   alt ↑↓ tasks   ^⇧N new task   ^⇧H handoff   F1 all commands";
+
+/// The views of a project, in the bar under the project tabs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    Tasks,
+    Files,
+    Notes,
+    Workflows,
+    Artifacts,
+    Git,
+    Processes,
+}
+
+impl View {
+    const ALL: [View; 7] = [View::Tasks, View::Files, View::Notes, View::Workflows, View::Artifacts, View::Git, View::Processes];
+
+    fn name(self) -> &'static str {
+        match self {
+            View::Tasks => "tasks",
+            View::Files => "files",
+            View::Notes => "notes",
+            View::Workflows => "workflows",
+            View::Artifacts => "artifacts",
+            View::Git => "git",
+            View::Processes => "processes",
+        }
+    }
+}
+
+/// What a row on a list page does when you pick it.
+#[derive(Clone)]
+enum PageAct {
+    OpenArtifact(String, String),
+    Edit(PathBuf),
+    NewNote,
+    RunWorkflow(Box<Workflow>),
+    NewWorkflow,
+    OpenUrl(String),
+    StopProcess(i32),
+    Obsidian,
+    LinkNotes,
+    Refresh,
+}
+
+/// A row on a list page: what it shows, what Enter does, and what the
+/// second key (e or x) does.
+struct PageItem {
+    markup: String,
+    act: Option<PageAct>,
+    alt: Option<PageAct>,
+}
 
 /// Everything Codebench can do, with its key. F1 lists these and runs the
 /// one you pick, so a key another program grabs never locks you out.
@@ -58,7 +109,7 @@ enum Action {
 const ACTIONS: &[(&str, &str, Action)] = &[
     ("Ctrl+Shift+N", "new task in this project", Action::NewTask),
     ("Ctrl+Shift+P", "workflows: run, edit (^E) or create saved prompts", Action::Workflows),
-    ("Ctrl+Shift+E", "edit project notes (brief and handoffs)", Action::Notes),
+    ("Ctrl+Shift+E", "notes: brief, handoffs, your own notes (Alt+3)", Action::Notes),
     ("Ctrl+Shift+H", "hand off: write a note, continue in a fresh session", Action::Handoff),
     ("Ctrl+Shift+O", "add a project: new (with git), one of your folders, or browse", Action::AddProject),
     ("Ctrl+Shift+I", "import past Claude and Codex chats for this project", Action::Import),
@@ -81,6 +132,8 @@ const ACTIONS: &[(&str, &str, Action)] = &[
 /// Keys with no action of their own, listed after the actions.
 const OTHER_KEYS: &[(&str, &str)] = &[
     ("Tab", "in the new task box: give the task its own git worktree"),
+    ("Ctrl+1 … 9", "switch to project tab 1 to 9 (Ctrl+PgUp / PgDn: previous / next)"),
+    ("Alt+1 … 7", "views: tasks, files, notes, workflows, artifacts, git, processes"),
     ("Ctrl+Shift+← / →", "focus the left or right side of a split"),
     ("Ctrl+Shift+C / V", "copy / paste"),
     ("Alt+Up / Down", "previous / next row"),
@@ -153,8 +206,8 @@ impl Status {
 enum Row {
     Project(String),
     Notes(String),
-    Git(String),
-    Artifacts(String),
+    /// The "+ new task" row at the end of the task list.
+    NewTask(String),
     Session(String),
 }
 
@@ -306,6 +359,7 @@ enum PickerMode {
     NewTask,
     Rename(String),
     RenameProject(String),
+    NewNote(String),
     Help,
     Workflows(String),
     Accounts,
@@ -412,8 +466,16 @@ struct App {
     artifact_server: Option<artifacts::Server>,
     /// Viewer windows by artifact, so showing it again just reloads.
     viewers: RefCell<HashMap<String, std::process::Child>>,
-    artifact_list: gtk::ListBox,
-    artifact_rows: RefCell<Vec<(String, String)>>,
+    tabs_box: gtk::Box,
+    view_buttons: Vec<(View, gtk::Button)>,
+    view: Cell<View>,
+    page_title: gtk::Label,
+    page_list: gtk::ListBox,
+    page_items: RefCell<Vec<PageItem>>,
+    /// The task you last looked at in each project, reopened with its tab.
+    last_task: RefCell<HashMap<String, String>>,
+    /// A handle on the app itself, for widgets built outside Rc methods.
+    me: RefCell<std::rc::Weak<App>>,
     /// Holds off suspend while any agent is working.
     keep_awake: RefCell<Option<std::process::Child>>,
     current_project: RefCell<Option<String>>,
@@ -525,29 +587,36 @@ impl App {
         // No client-side titlebar: Hyprland draws the border, like a terminal.
         window.set_decorated(false);
 
-        // The sidebar and the main area, with a draggable divider.
+        // The tasks list and the main area, with a draggable divider.
         let root = gtk::Paned::new(gtk::Orientation::Horizontal);
         root.add_css_class("cb-root");
         root.set_wide_handle(false);
         root.set_shrink_start_child(false);
         root.set_resize_start_child(false);
+        root.set_vexpand(true);
+        // Dragging still works; keyboard focus on the divider only drew a
+        // highlight bar.
+        root.set_focusable(false);
 
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_box.add_css_class("cb-sidebar");
         sidebar_box.set_width_request(160);
-        let brand = label("cb-brand");
-        brand.set_text("codebench");
         let sidebar = gtk::ListBox::new();
         sidebar.set_selection_mode(gtk::SelectionMode::Single);
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroller.set_vexpand(true);
         scroller.set_child(Some(&sidebar));
-        let subs = label("cb-footer");
-        subs.set_wrap(true);
-        subs.set_wrap_mode(pango::WrapMode::WordChar);
-        // Keep the login summary from widening the sidebar.
-        subs.set_max_width_chars(28);
+        sidebar_box.append(&scroller);
+
+        // Project tabs across the top, like tmux windows, with the agents'
+        // logins and limits on the right.
+        let tabbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabbar.add_css_class("cb-tabs");
+        let tabs_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabs_box.set_hexpand(true);
+        let subs = label("cb-dim");
+        subs.set_margin_end(10);
         subs.set_text(&format!(
             "agents: {}",
             agents::installed()
@@ -557,9 +626,24 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-        sidebar_box.append(&brand);
-        sidebar_box.append(&scroller);
-        sidebar_box.append(&subs.clone());
+        tabbar.append(&tabs_box);
+        tabbar.append(&subs.clone());
+
+        // The current project's views.
+        let viewbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        viewbar.add_css_class("cb-views");
+        let mut view_buttons = Vec::new();
+        for (i, v) in View::ALL.iter().enumerate() {
+            let l = gtk::Label::new(None);
+            l.set_markup(&format!("<span alpha='50%'>{}</span> {}", i + 1, v.name()));
+            let b = gtk::Button::new();
+            b.set_child(Some(&l));
+            b.set_has_frame(false);
+            b.set_focus_on_click(false);
+            b.add_css_class("cb-view");
+            viewbar.append(&b);
+            view_buttons.push((*v, b));
+        }
 
         let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
         main.set_hexpand(true);
@@ -595,14 +679,20 @@ impl App {
         board_scroll.set_child(Some(&board));
         stack.add_named(&board_scroll, Some("project"));
 
-        // The artifacts page: one row per artifact, Enter or click opens it.
-        let artifact_list = gtk::ListBox::new();
-        artifact_list.set_selection_mode(gtk::SelectionMode::Single);
-        artifact_list.add_css_class("cb-board");
-        let artifact_scroll = gtk::ScrolledWindow::new();
-        artifact_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        artifact_scroll.set_child(Some(&artifact_list));
-        stack.add_named(&artifact_scroll, Some("artifacts"));
+        // List pages (notes, workflows, artifacts, processes): a title line
+        // and rows; Enter or a click picks one.
+        let page_title = label("cb-page-title");
+        page_title.set_wrap(true);
+        let page_list = gtk::ListBox::new();
+        page_list.set_selection_mode(gtk::SelectionMode::Single);
+        page_list.add_css_class("cb-page");
+        let page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page_box.append(&page_title);
+        page_box.append(&page_list);
+        let page_scroll = gtk::ScrolledWindow::new();
+        page_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        page_scroll.set_child(Some(&page_box));
+        stack.add_named(&page_scroll, Some("page"));
 
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&stack));
@@ -624,6 +714,7 @@ impl App {
         paned.set_resize_start_child(true);
         paned.set_resize_end_child(true);
         paned.set_vexpand(true);
+        paned.set_focusable(false);
         let picker = Picker::build();
         overlay.add_overlay(&picker.root);
 
@@ -636,6 +727,10 @@ impl App {
         main.append(&footer);
         root.set_start_child(Some(&sidebar_box));
         root.set_end_child(Some(&main));
+        let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        shell.append(&tabbar);
+        shell.append(&viewbar);
+        shell.append(&root);
         root.set_position(ui_settings().sidebar_width);
         root.connect_position_notify(|paned| {
             let width = paned.position();
@@ -643,7 +738,7 @@ impl App {
                 save_ui_settings(&UiSettings { sidebar_width: width });
             }
         });
-        window.set_child(Some(&root));
+        window.set_child(Some(&shell));
 
         let status_dir = store::cache_dir().join("status");
         let _ = std::fs::remove_dir_all(&status_dir);
@@ -685,8 +780,14 @@ impl App {
             keep_awake: RefCell::default(),
             artifact_server: artifacts::Server::start().ok(),
             viewers: RefCell::default(),
-            artifact_list,
-            artifact_rows: RefCell::default(),
+            tabs_box,
+            view_buttons,
+            view: Cell::new(View::Tasks),
+            page_title,
+            page_list,
+            page_items: RefCell::default(),
+            last_task: RefCell::default(),
+            me: RefCell::default(),
             board,
             remote: RefCell::default(),
             screen_pending: RefCell::default(),
@@ -697,6 +798,7 @@ impl App {
             reload_pending: Cell::new(false),
             pending_delete: RefCell::default(),
         });
+        *bench.me.borrow_mut() = Rc::downgrade(&bench);
         bench.connect();
         bench.watch();
 
@@ -776,39 +878,51 @@ impl App {
             }
             let Some(row) = row else { return };
             let kind = b.rows.borrow().get(row.index() as usize).cloned();
-            match kind {
-                Some(Row::Project(pid)) => b.show_project(&pid),
-                Some(Row::Notes(pid)) => b.show_notes(&pid),
-                Some(Row::Artifacts(pid)) => b.show_artifacts(&pid),
-                Some(Row::Git(pid)) => {
-                    // Like tasks, open only if the row is still selected a
-                    // moment later, so moving past it does not start lazygit.
-                    let b2 = b.clone();
-                    glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                        let still = b2.sidebar.selected_row().and_then(|r| b2.rows.borrow().get(r.index() as usize).cloned());
-                        if still != Some(Row::Git(pid.clone())) {
-                            return;
-                        }
-                        let path = b2.state.borrow().project(&pid).map(|p| p.path.clone());
-                        if let Some(path) = path {
-                            *b2.current_project.borrow_mut() = Some(pid.clone());
-                            *b2.return_to.borrow_mut() = Some(Row::Project(pid));
-                            b2.open_git(&path);
-                        }
-                    });
-                }
-                Some(Row::Session(sid)) => b.show_session(&sid),
-                None => {}
+            if let Some(Row::Session(sid)) = kind {
+                b.show_session(&sid);
+            }
+        });
+        let b = self.clone();
+        self.sidebar.connect_row_activated(move |_, row| {
+            let kind = b.rows.borrow().get(row.index() as usize).cloned();
+            if let Some(Row::NewTask(_)) = kind {
+                b.open_new_task();
             }
         });
 
+        for (view, button) in &self.view_buttons {
+            let b = self.clone();
+            let view = *view;
+            button.connect_clicked(move |_| b.show_view(view));
+        }
+
         let b = self.clone();
-        self.artifact_list.connect_row_activated(move |_, row| {
-            let picked = b.artifact_rows.borrow().get(row.index() as usize).cloned();
-            if let Some((pid, file)) = picked {
-                b.open_viewer(&pid, &file);
+        self.page_list.connect_row_activated(move |_, row| {
+            let act = b.page_items.borrow().get(row.index() as usize).and_then(|i| i.act.clone());
+            if let Some(act) = act {
+                b.run_page_act(act);
             }
         });
+        let page_keys = gtk::EventControllerKey::new();
+        let b = self.clone();
+        page_keys.connect_key_pressed(move |_, key, _, mods| {
+            if mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            if !matches!(key.to_lower(), gdk::Key::e | gdk::Key::x | gdk::Key::Delete) {
+                return glib::Propagation::Proceed;
+            }
+            let idx = b.page_list.selected_row().map(|r| r.index()).unwrap_or(-1);
+            let alt = b.page_items.borrow().get(idx as usize).and_then(|i| i.alt.clone());
+            match alt {
+                Some(act) => {
+                    b.run_page_act(act);
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
+            }
+        });
+        self.page_list.add_controller(page_keys);
 
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -972,8 +1086,8 @@ impl App {
             if transient(&key) {
                 return self.current_project.borrow().clone().map(Row::Project);
             }
-            if let Some(pid) = key.strip_prefix("artifacts:") {
-                return Some(Row::Artifacts(pid.to_string()));
+            if key.starts_with("page:") {
+                return self.current_project.borrow().clone().map(Row::Project);
             }
             return Some(match key.strip_prefix("notes:") {
                 Some(pid) => Row::Notes(pid.to_string()),
@@ -983,56 +1097,90 @@ impl App {
         self.current_project.borrow().clone().map(Row::Project)
     }
 
+    /// Redraws the project tabs, the view bar and the current project's
+    /// task list, and publishes task status for the widget and the phone.
     fn rebuild_sidebar(&self) {
         self.rebuilding.set(true);
         while let Some(child) = self.sidebar.first_child() {
             self.sidebar.remove(&child);
         }
+        while let Some(child) = self.tabs_box.first_child() {
+            self.tabs_box.remove(&child);
+        }
         let theme = self.theme.borrow();
         let state = self.state.borrow();
         let context = self.context.borrow();
         let show_archived = self.show_archived.get();
+        let current = self.current_project.borrow().clone();
+        let me = self.me.borrow().upgrade();
         let mut rows = Vec::new();
 
-        for p in &state.projects {
+        // Tabs: number, name, browser mark, and how many tasks need you.
+        for (i, p) in state.projects.iter().enumerate() {
             let attention = p.sessions.iter().filter(|s| self.status_of(&s.id).wants_attention()).count();
-            let badge = if attention > 0 {
-                format!("  <span foreground='{}'>{attention}</span>", theme.red)
-            } else {
-                String::new()
+            let working = p.sessions.iter().filter(|s| self.status_of(&s.id) == Status::Working).count();
+            let badge = match (attention, working) {
+                (0, 0) => String::new(),
+                (0, _) => format!(" <span foreground='{}'>●</span>", theme.yellow),
+                (n, _) => format!(" <span foreground='{}'>●{n}</span>", theme.red),
             };
-            let web = if p.browser { format!("  <span foreground='{}'>◍</span>", theme.muted) } else { String::new() };
-            let row = row_with(&format!("<b>{}</b>{web}{badge}", esc(&p.name)));
-            row.add_css_class("cb-project");
-            self.sidebar.append(&row);
-            rows.push(Row::Project(p.id.clone()));
-
-            let vault = if notes::vault_root(&p.notes_dir()).is_some() { "  vault" } else { "" };
-            let glyph = if self.status_of(&notes_key(&p.id)).running() { "✎" } else { "≡" };
-            self.sidebar.append(&row_with(&format!(
-                "  <span foreground='{m}'>{glyph} notes{vault}</span>",
-                m = theme.muted
-            )));
-            rows.push(Row::Notes(p.id.clone()));
-
-            if let Some(branch) = self.git_branch_of(&p.path) {
-                let changed = match self.git_changes(&p.path) {
-                    Some(0) | None => String::new(),
-                    Some(n) => format!("  <span foreground='{}'>+{n}</span>", theme.yellow),
-                };
-                self.sidebar.append(&row_with(&format!(
-                    "  <span foreground='{m}'>± git  {}</span>{changed}",
-                    esc(&branch),
-                    m = theme.muted
-                )));
-                rows.push(Row::Git(p.id.clone()));
+            let web = if p.browser { format!(" <span foreground='{}'>◍</span>", theme.muted) } else { String::new() };
+            let number = if i < 9 { format!("<span alpha='50%'>{}</span> ", i + 1) } else { String::new() };
+            let l = gtk::Label::new(None);
+            l.set_markup(&format!("{number}{}{web}{badge}", esc(&p.name)));
+            let tab = gtk::Button::new();
+            tab.set_child(Some(&l));
+            tab.set_has_frame(false);
+            tab.set_focus_on_click(false);
+            tab.add_css_class("cb-tab");
+            if current.as_deref() == Some(p.id.as_str()) {
+                tab.add_css_class("active");
             }
+            if let Some(me) = me.clone() {
+                let pid = p.id.clone();
+                tab.connect_clicked(move |_| me.switch_project(&pid));
+            }
+            self.tabs_box.append(&tab);
+        }
+        let add = gtk::Button::with_label("+");
+        add.set_has_frame(false);
+        add.set_focus_on_click(false);
+        add.add_css_class("cb-tab");
+        add.set_tooltip_text(Some("add a project (Ctrl+Shift+O)"));
+        if let Some(me) = me.clone() {
+            add.connect_clicked(move |_| me.open_add_project());
+        }
+        self.tabs_box.append(&add);
 
-            let made = artifacts::list(p).len();
-            let count = if made > 0 { format!("  {made}") } else { String::new() };
-            self.sidebar.append(&row_with(&format!("  <span foreground='{m}'>◆ artifacts{count}</span>", m = theme.muted)));
-            rows.push(Row::Artifacts(p.id.clone()));
+        let here = current.as_deref().and_then(|id| state.project(id));
+        for (i, (view, button)) in self.view_buttons.iter().enumerate() {
+            if *view == self.view.get() && current.is_some() {
+                button.add_css_class("active");
+            } else {
+                button.remove_css_class("active");
+            }
+            // The git and artifacts buttons carry a little status.
+            let extra = match (view, here) {
+                (View::Git, Some(p)) => match self.git_branch_of(&p.path) {
+                    Some(branch) => match self.git_changes(&p.path) {
+                        Some(n) if n > 0 => format!(" <span foreground='{}'>{} +{n}</span>", theme.muted, esc(&branch)),
+                        _ => format!(" <span foreground='{}'>{}</span>", theme.muted, esc(&branch)),
+                    },
+                    None => String::new(),
+                },
+                (View::Artifacts, Some(p)) => match artifacts::list(p).len() {
+                    0 => String::new(),
+                    n => format!(" <span foreground='{}'>{n}</span>", theme.muted),
+                },
+                _ => String::new(),
+            };
+            if let Some(l) = button.child().and_downcast::<gtk::Label>() {
+                l.set_markup(&format!("<span alpha='50%'>{}</span> {}{extra}", i + 1, view.name()));
+            }
+        }
 
+        // The current project's tasks.
+        if let Some(p) = current.as_deref().and_then(|id| state.project(id)) {
             for s in p.sessions.iter().filter(|s| show_archived || !s.archived) {
                 let (glyph, color, word) = self.status_of(&s.id).look(&theme);
                 let word = if word.is_empty() {
@@ -1073,13 +1221,18 @@ impl App {
                     None => title,
                 };
                 self.sidebar.append(&row_with(&format!(
-                    "  <span foreground='{color}'>{glyph}</span> <span foreground='{}'>{:<8}</span>{title}{tokens}{word}",
+                    "<span foreground='{color}'>{glyph}</span> <span foreground='{}'>{:<8}</span>{title}{tokens}{word}",
                     theme.muted,
                     esc(&s.agent),
                 )));
                 rows.push(Row::Session(s.id.clone()));
             }
+            let new = row_with(&format!("<span foreground='{}'>+ new task</span>   <span alpha='50%'>^⇧N</span>", theme.muted));
+            new.add_css_class("cb-new");
+            self.sidebar.append(&new);
+            rows.push(Row::NewTask(p.id.clone()));
         }
+
         let snapshot = state
             .projects
             .iter()
@@ -1092,25 +1245,345 @@ impl App {
 
         let idx = self.selected_row().and_then(|sel| rows.iter().position(|r| *r == sel));
         *self.rows.borrow_mut() = rows;
-        if let Some(row) = idx.and_then(|i| self.sidebar.row_at_index(i as i32)) {
-            self.sidebar.select_row(Some(&row));
+        match idx.and_then(|i| self.sidebar.row_at_index(i as i32)) {
+            Some(row) => self.sidebar.select_row(Some(&row)),
+            None => self.sidebar.unselect_all(),
         }
         self.rebuilding.set(false);
     }
 
-    /// Selects a sidebar row, which shows it through `row_selected`.
+    /// Shows a row: a task opens its terminal (switching tabs if needed);
+    /// the other kinds switch to their project's view.
     fn select(&self, target: &Row) {
-        let idx = self.rows.borrow().iter().position(|r| r == target);
-        if let Some(row) = idx.and_then(|i| self.sidebar.row_at_index(i as i32)) {
-            self.sidebar.select_row(Some(&row));
+        let Some(me) = self.me.borrow().upgrade() else { return };
+        match target {
+            Row::Session(sid) => {
+                let Some(pid) = self.state.borrow().session(sid).map(|(p, _)| p.id.clone()) else { return };
+                if self.current_project.borrow().as_deref() != Some(pid.as_str()) {
+                    *self.current_project.borrow_mut() = Some(pid);
+                    *self.current_key.borrow_mut() = Some(sid.clone());
+                    self.rebuild_sidebar();
+                }
+                let idx = self.rows.borrow().iter().position(|r| r == target);
+                let already = self.sidebar.selected_row().map(|r| r.index() as usize) == idx;
+                match idx.and_then(|i| self.sidebar.row_at_index(i as i32)) {
+                    Some(row) if !already => self.sidebar.select_row(Some(&row)),
+                    _ => me.show_session(sid),
+                }
+            }
+            Row::Project(pid) => me.switch_project(pid),
+            Row::Notes(pid) => {
+                *self.current_project.borrow_mut() = Some(pid.clone());
+                me.show_view(View::Notes);
+            }
+            Row::NewTask(_) => {}
         }
     }
 
     fn move_selection(&self, delta: i32) {
         let idx = self.sidebar.selected_row().map(|r| r.index()).unwrap_or(-1) + delta;
         if let Some(row) = self.sidebar.row_at_index(idx) {
-            self.sidebar.select_row(Some(&row));
+            let is_task = matches!(self.rows.borrow().get(idx as usize), Some(Row::Session(_)));
+            if is_task {
+                self.sidebar.select_row(Some(&row));
+            }
         }
+    }
+
+    /// Switches to a project's tab, back to the task you last had open
+    /// there, or its board.
+    fn switch_project(self: &Rc<Self>, pid: &str) {
+        let last = self.last_task.borrow().get(pid).cloned();
+        let last = last.filter(|sid| self.state.borrow().session(sid).is_some_and(|(p, s)| p.id == pid && !s.archived));
+        *self.current_project.borrow_mut() = Some(pid.to_string());
+        self.view.set(View::Tasks);
+        match last {
+            Some(sid) => {
+                *self.current_key.borrow_mut() = Some(sid.clone());
+                self.rebuild_sidebar();
+                self.show_session(&sid);
+            }
+            None => {
+                *self.current_key.borrow_mut() = None;
+                self.rebuild_sidebar();
+                self.show_project(pid);
+            }
+        }
+    }
+
+    /// Moves to the tab `delta` away from the current one, wrapping.
+    fn cycle_project(self: &Rc<Self>, delta: i32) {
+        let ids: Vec<String> = self.state.borrow().projects.iter().map(|p| p.id.clone()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let cur = self.current_project.borrow().clone();
+        let i = cur.and_then(|c| ids.iter().position(|x| *x == c)).unwrap_or(0) as i32;
+        let n = ids.len() as i32;
+        let next = ((i + delta) % n + n) % n;
+        self.switch_project(&ids[next as usize]);
+    }
+
+    fn project_tab(self: &Rc<Self>, index: usize) {
+        let id = self.state.borrow().projects.get(index).map(|p| p.id.clone());
+        if let Some(id) = id {
+            self.switch_project(&id);
+        }
+    }
+
+    fn show_view(self: &Rc<Self>, view: View) {
+        let Some(pid) = self.current_project.borrow().clone() else {
+            self.flash("add a project first (Ctrl+Shift+O)");
+            return;
+        };
+        self.view.set(view);
+        match view {
+            View::Tasks => {
+                *self.current_key.borrow_mut() = None;
+                self.show_project(&pid);
+            }
+            View::Files => {
+                *self.current_key.borrow_mut() = None;
+                self.open_files();
+            }
+            View::Git => {
+                *self.current_key.borrow_mut() = None;
+                self.open_git_here();
+            }
+            View::Notes => self.show_notes_page(&pid),
+            View::Workflows => self.show_workflows_page(&pid),
+            View::Artifacts => self.show_artifacts(&pid),
+            View::Processes => self.show_processes_page(&pid),
+        }
+        self.rebuild_sidebar();
+    }
+
+    // ── list pages ─────────────────────────────────────────────────────────
+
+    fn show_page(&self, pid: &str, view: View, hint: &str, items: Vec<PageItem>) {
+        let Some(p) = self.state.borrow().project(pid).cloned() else { return };
+        *self.current_project.borrow_mut() = Some(pid.to_string());
+        *self.current_key.borrow_mut() = Some(format!("page:{}:{pid}", view.name()));
+        let theme = self.theme.borrow();
+        self.page_title.set_markup(&format!(
+            "<span foreground='{}'><b>{}</b></span>   <span foreground='{}'>{}</span>",
+            theme.accent,
+            view.name(),
+            theme.muted,
+            esc(hint)
+        ));
+        while let Some(child) = self.page_list.first_child() {
+            self.page_list.remove(&child);
+        }
+        for item in &items {
+            let l = gtk::Label::new(None);
+            l.set_xalign(0.0);
+            l.set_ellipsize(pango::EllipsizeMode::End);
+            l.set_markup(&item.markup);
+            let row = gtk::ListBoxRow::new();
+            row.set_child(Some(&l));
+            row.set_activatable(item.act.is_some());
+            row.set_selectable(item.act.is_some());
+            self.page_list.append(&row);
+        }
+        *self.page_items.borrow_mut() = items;
+        self.stack.set_visible_child_name("page");
+        self.header_left.set_markup(&format!(
+            "<span foreground='{}'><b>{}</b></span>  <span foreground='{}'>›</span>  {}",
+            theme.accent,
+            esc(&p.name),
+            theme.muted,
+            view.name()
+        ));
+        drop(theme);
+        self.header_right.set_text(&tilde(&p.path));
+        if let Some(first) = (0..self.page_items.borrow().len() as i32)
+            .find(|&i| self.page_items.borrow()[i as usize].act.is_some())
+            .and_then(|i| self.page_list.row_at_index(i))
+        {
+            self.page_list.select_row(Some(&first));
+            first.grab_focus();
+        }
+    }
+
+    fn section(&self, title: &str) -> PageItem {
+        PageItem {
+            markup: format!("\n<span foreground='{}'><b>{}</b></span>", self.theme.borrow().muted, esc(&title.to_uppercase())),
+            act: None,
+            alt: None,
+        }
+    }
+
+    fn run_page_act(self: &Rc<Self>, act: PageAct) {
+        let pid = self.current_project.borrow().clone().unwrap_or_default();
+        let project = self.state.borrow().project(&pid).cloned();
+        match act {
+            PageAct::OpenArtifact(pid, file) => self.open_viewer(&pid, &file),
+            PageAct::Edit(path) => {
+                if let Some(p) = project {
+                    self.edit_file(&p, &path);
+                }
+            }
+            PageAct::NewNote => {
+                self.picker.fill("new note", Some(("note name", "")), &[]);
+                *self.picker.mode.borrow_mut() = PickerMode::NewNote(pid);
+                self.picker.show();
+            }
+            PageAct::RunWorkflow(wf) => self.run_workflow(&pid, &wf, true),
+            PageAct::NewWorkflow => self.open_workflows(),
+            PageAct::OpenUrl(url) => {
+                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+            }
+            PageAct::StopProcess(p) => {
+                crate::processes::stop(p);
+                self.flash(&format!("stopped process {p}"));
+                let b = self.clone();
+                glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                    let pid = b.current_project.borrow().clone();
+                    if let Some(pid) = pid {
+                        b.show_processes_page(&pid);
+                    }
+                });
+            }
+            PageAct::Obsidian => self.open_in_obsidian(),
+            PageAct::LinkNotes => self.link_notes_dialog(false),
+            PageAct::Refresh => {
+                let view = self.view.get();
+                self.show_view(view);
+            }
+        }
+    }
+
+    fn show_notes_page(self: &Rc<Self>, pid: &str) {
+        let Some(p) = self.state.borrow().project(pid).cloned() else { return };
+        let dir = notes::ensure(&p);
+        let theme = self.theme.borrow().clone();
+        let md_files = |sub: &Path| -> Vec<(u64, PathBuf)> {
+            let mut out: Vec<(u64, PathBuf)> = std::fs::read_dir(sub)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "md"))
+                .map(|p| {
+                    let t = std::fs::metadata(&p)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs());
+                    (t, p)
+                })
+                .collect();
+            out.sort_by(|a, b| b.0.cmp(&a.0));
+            out
+        };
+        let row = |path: &Path, when: u64| PageItem {
+            markup: format!(
+                "{}   <span foreground='{}'>{}</span>",
+                esc(&path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                theme.muted,
+                workflow::stamp(when)
+            ),
+            act: Some(PageAct::Edit(path.to_path_buf())),
+            alt: None,
+        };
+        let mut items = vec![
+            PageItem {
+                markup: format!("<span foreground='{}'>★</span> brief   <span foreground='{}'>every task reads this</span>", theme.accent, theme.muted),
+                act: Some(PageAct::Edit(dir.join("brief.md"))),
+                alt: None,
+            },
+            PageItem { markup: format!("<span foreground='{}'>+ new note</span>", theme.accent), act: Some(PageAct::NewNote), alt: None },
+        ];
+        let own: Vec<_> = md_files(&dir).into_iter().filter(|(_, p)| p.file_name().is_some_and(|n| n != "brief.md")).collect();
+        if !own.is_empty() {
+            items.push(self.section("your notes"));
+            items.extend(own.iter().map(|(t, p)| row(p, *t)));
+        }
+        let handoffs = md_files(&dir.join("handoffs"));
+        if !handoffs.is_empty() {
+            items.push(self.section("handoffs"));
+            items.extend(handoffs.iter().map(|(t, p)| row(p, *t)));
+        }
+        let runs = md_files(&dir.join("runs"));
+        if !runs.is_empty() {
+            items.push(self.section("workflow runs"));
+            items.extend(runs.iter().take(20).map(|(t, p)| row(p, *t)));
+        }
+        items.push(self.section("obsidian"));
+        items.push(if notes::vault_root(&dir).is_some() {
+            PageItem { markup: "open the brief in Obsidian".into(), act: Some(PageAct::Obsidian), alt: None }
+        } else {
+            PageItem { markup: "link these notes into your Obsidian vault".into(), act: Some(PageAct::LinkNotes), alt: None }
+        });
+        self.show_page(pid, View::Notes, &format!("enter opens in your editor · {}", tilde(&dir)), items);
+    }
+
+    fn show_workflows_page(self: &Rc<Self>, pid: &str) {
+        let Some(p) = self.state.borrow().project(pid).cloned() else { return };
+        let theme = self.theme.borrow().clone();
+        let mut items = vec![PageItem {
+            markup: format!("<span foreground='{}'>+ new workflow</span>", theme.accent),
+            act: Some(PageAct::NewWorkflow),
+            alt: None,
+        }];
+        for wf in workflow::list(&p) {
+            let when = match (&wf.schedule, &wf.schedule_text) {
+                (Some(_), Some(t)) => format!(" · {t}"),
+                (None, Some(t)) => format!(" · can't read schedule \"{t}\""),
+                _ => String::new(),
+            };
+            let from = match (&wf.collection, wf.global) {
+                (Some(c), _) => format!(" · {c}"),
+                (None, true) => " · global".into(),
+                _ => String::new(),
+            };
+            items.push(PageItem {
+                markup: format!(
+                    "<span foreground='{}'>▶</span> {}   <span foreground='{}'>{}{when}{from}</span>",
+                    theme.accent,
+                    esc(&wf.name),
+                    theme.muted,
+                    esc(&wf.agent)
+                ),
+                act: Some(PageAct::RunWorkflow(Box::new(wf.clone()))),
+                alt: Some(PageAct::Edit(wf.path.clone())),
+            });
+        }
+        self.show_page(pid, View::Workflows, "enter runs · e edits", items);
+    }
+
+    fn show_processes_page(self: &Rc<Self>, pid: &str) {
+        let Some(p) = self.state.borrow().project(pid).cloned() else { return };
+        let theme = self.theme.borrow().clone();
+        let mut roots = vec![p.path.clone()];
+        roots.extend(p.sessions.iter().filter_map(|s| s.worktree.as_ref().map(|w| w.path.clone())));
+        let servers = crate::processes::in_folders(&roots);
+        let mut items = Vec::new();
+        if servers.is_empty() {
+            items.push(PageItem {
+                markup: format!("<span foreground='{}'>nothing from this project is listening on a port</span>", theme.muted),
+                act: None,
+                alt: None,
+            });
+        }
+        for sv in &servers {
+            let ports: Vec<String> = sv.ports.iter().map(|p| format!(":{p}")).collect();
+            items.push(PageItem {
+                markup: format!(
+                    "<span foreground='{}'>●</span> <b>{}</b>   {}   <span foreground='{}'>pid {}</span>",
+                    theme.green,
+                    ports.join(" "),
+                    esc(&crate::processes::short_command(&sv.command, &sv.cwd)),
+                    theme.muted,
+                    sv.pid
+                ),
+                act: sv.ports.first().map(|port| PageAct::OpenUrl(format!("http://localhost:{port}"))),
+                alt: Some(PageAct::StopProcess(sv.pid)),
+            });
+        }
+        items.push(PageItem { markup: format!("<span foreground='{}'>↻ refresh</span>", theme.muted), act: Some(PageAct::Refresh), alt: None });
+        self.show_page(pid, View::Processes, "servers started in this project's folders · enter opens in the browser · x stops", items);
     }
 
     // ── main area ──────────────────────────────────────────────────────────
@@ -1334,6 +1807,13 @@ impl App {
 
     fn show_session(self: &Rc<Self>, sid: &str) {
         let Some(pid) = self.state.borrow().session(sid).map(|(p, _)| p.id.clone()) else { return };
+        self.last_task.borrow_mut().insert(pid.clone(), sid.to_string());
+        if self.view.get() != View::Tasks {
+            self.view.set(View::Tasks);
+            for (view, button) in &self.view_buttons {
+                if *view == View::Tasks { button.add_css_class("active") } else { button.remove_css_class("active") }
+            }
+        }
         *self.current_project.borrow_mut() = Some(pid);
         *self.current_key.borrow_mut() = Some(sid.to_string());
         let id = sid.to_string();
@@ -2076,45 +2556,34 @@ impl App {
 
     fn show_artifacts(self: &Rc<Self>, pid: &str) {
         let Some(p) = self.state.borrow().project(pid).cloned() else { return };
-        *self.current_project.borrow_mut() = Some(pid.to_string());
-        *self.current_key.borrow_mut() = Some(format!("artifacts:{pid}"));
-        while let Some(child) = self.artifact_list.first_child() {
-            self.artifact_list.remove(&child);
-        }
+        let theme = self.theme.borrow().clone();
         let list = artifacts::list(&p);
-        let theme = self.theme.borrow();
-        if list.is_empty() {
-            let l = label("cb-dim");
-            l.set_wrap(true);
-            l.set_text(
-                "no artifacts yet.\n\nAsk an agent to show you something (\"make a chart of…\", \"sketch the page as HTML\", \"draw the architecture as a mermaid diagram\") and it appears here and opens in a viewer next to Codebench.",
-            );
-            self.artifact_list.append(&l);
+        let mut items: Vec<PageItem> = list
+            .iter()
+            .map(|a| PageItem {
+                markup: format!(
+                    "<span foreground='{}'>◆</span> {}   <span foreground='{}'>{} · {}</span>",
+                    theme.accent,
+                    esc(&a.title),
+                    theme.muted,
+                    a.kind,
+                    workflow::stamp(a.modified)
+                ),
+                act: Some(PageAct::OpenArtifact(pid.to_string(), a.file.clone())),
+                alt: None,
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(PageItem {
+                markup: format!(
+                    "<span foreground='{}'>no artifacts yet. ask an agent to show you something (a chart, a page, a diagram) and it appears here.</span>",
+                    theme.muted
+                ),
+                act: None,
+                alt: None,
+            });
         }
-        let mut rows = Vec::new();
-        for a in &list {
-            let l = gtk::Label::new(None);
-            l.set_xalign(0.0);
-            l.set_markup(&format!(
-                "<span foreground='{}'>◆</span> {}   <span foreground='{}'>{} · {}</span>",
-                theme.accent,
-                esc(&a.title),
-                theme.muted,
-                a.kind,
-                workflow::stamp(a.modified)
-            ));
-            self.artifact_list.append(&l);
-            rows.push((pid.to_string(), a.file.clone()));
-        }
-        *self.artifact_rows.borrow_mut() = rows;
-        self.stack.set_visible_child_name("artifacts");
-        self.header_left.set_markup(&format!(
-            "<span foreground='{}'><b>{}</b></span>  <span foreground='{}'>›</span>  artifacts",
-            theme.accent,
-            esc(&p.name),
-            theme.muted
-        ));
-        self.header_right.set_text(&tilde(&artifacts::dir(&p)));
+        self.show_page(pid, View::Artifacts, &format!("enter opens the viewer · {}", tilde(&artifacts::dir(&p))), items);
     }
 
     /// Opens an artifact in its own window next to Codebench (a Chromium
@@ -2147,7 +2616,7 @@ impl App {
             }
             Err(e) => self.flash(&format!("could not open the viewer: {e}")),
         }
-        if self.current_key.borrow().as_deref() == Some(&format!("artifacts:{pid}")) {
+        if self.current_key.borrow().as_deref() == Some(&format!("page:artifacts:{pid}")) {
             self.show_artifacts(pid);
         }
     }
@@ -2532,14 +3001,11 @@ impl App {
                 self.select(&Row::Notes(pid.clone()));
                 self.show_notes(&pid);
             }
-            Some(Row::Project(pid) | Row::Git(pid)) => {
+            Some(Row::Project(pid)) => {
                 self.select(&Row::Project(pid.clone()));
                 self.show_project(&pid);
             }
-            Some(Row::Artifacts(pid)) => {
-                self.select(&Row::Artifacts(pid.clone()));
-                self.show_artifacts(&pid);
-            }
+            Some(Row::NewTask(pid)) => self.select(&Row::Project(pid)),
             None => self.show_empty(),
         }
         self.rebuild_sidebar();
@@ -2935,9 +3401,47 @@ impl App {
             return glib::Propagation::Stop;
         }
         if alt && !ctrl && !shift {
+            let view = match key {
+                gdk::Key::_1 => Some(View::Tasks),
+                gdk::Key::_2 => Some(View::Files),
+                gdk::Key::_3 => Some(View::Notes),
+                gdk::Key::_4 => Some(View::Workflows),
+                gdk::Key::_5 => Some(View::Artifacts),
+                gdk::Key::_6 => Some(View::Git),
+                gdk::Key::_7 => Some(View::Processes),
+                _ => None,
+            };
+            if let Some(view) = view {
+                self.show_view(view);
+                return glib::Propagation::Stop;
+            }
             match key {
                 gdk::Key::Up => self.move_selection(-1),
                 gdk::Key::Down => self.move_selection(1),
+                _ => return glib::Propagation::Proceed,
+            }
+            return glib::Propagation::Stop;
+        }
+        if ctrl && !shift && !alt {
+            let tab = match key {
+                gdk::Key::_1 => Some(0),
+                gdk::Key::_2 => Some(1),
+                gdk::Key::_3 => Some(2),
+                gdk::Key::_4 => Some(3),
+                gdk::Key::_5 => Some(4),
+                gdk::Key::_6 => Some(5),
+                gdk::Key::_7 => Some(6),
+                gdk::Key::_8 => Some(7),
+                gdk::Key::_9 => Some(8),
+                _ => None,
+            };
+            if let Some(i) = tab {
+                self.project_tab(i);
+                return glib::Propagation::Stop;
+            }
+            match key {
+                gdk::Key::Page_Up => self.cycle_project(-1),
+                gdk::Key::Page_Down => self.cycle_project(1),
                 _ => return glib::Propagation::Proceed,
             }
             return glib::Propagation::Stop;
@@ -3040,6 +3544,10 @@ impl App {
     }
 
     fn open_notes(self: &Rc<Self>) {
+        if self.current_project.borrow().is_some() {
+            self.show_view(View::Notes);
+            return;
+        }
         let pid = self.current_project.borrow().clone();
         match pid {
             Some(pid) => self.select(&Row::Notes(pid)),
@@ -3113,7 +3621,7 @@ impl App {
         let Some(target) = self.selected_row() else { return };
         let key = match &target {
             Row::Project(id) | Row::Session(id) => id.clone(),
-            Row::Notes(_) | Row::Git(_) | Row::Artifacts(_) => return,
+            Row::Notes(_) | Row::NewTask(_) => return,
         };
         let armed = self
             .pending_delete
@@ -3141,7 +3649,7 @@ impl App {
                 .project(pid)
                 .map(|p| p.sessions.iter().map(|s| s.id.clone()).chain([notes_key(pid)]).collect())
                 .unwrap_or_default(),
-            Row::Notes(_) | Row::Git(_) | Row::Artifacts(_) => Vec::new(),
+            Row::Notes(_) | Row::NewTask(_) => Vec::new(),
         };
         for key in &doomed {
             self.stop(key);
@@ -3173,7 +3681,7 @@ impl App {
                 state.projects.retain(|p| &p.id != pid);
                 state.projects.first().map(|p| Row::Project(p.id.clone()))
             }
-            Row::Notes(_) | Row::Git(_) | Row::Artifacts(_) => None,
+            Row::Notes(_) | Row::NewTask(_) => None,
         };
         state.save();
         drop(state);
@@ -3309,6 +3817,17 @@ impl App {
                 if let Some(action) = action {
                     self.run_action(action);
                 }
+            }
+            PickerMode::NewNote(pid) => {
+                self.close_picker();
+                let Some(p) = self.state.borrow().project(&pid).cloned() else { return };
+                let name = if text.is_empty() { "note".to_string() } else { text };
+                let stem = workflow::slug(&name);
+                let path = notes::ensure(&p).join(format!("{}.md", if stem.is_empty() { "note" } else { &stem }));
+                if !path.exists() {
+                    let _ = std::fs::write(&path, format!("# {name}\n\n"));
+                }
+                self.edit_file(&p, &path);
             }
             PickerMode::RenameProject(pid) => {
                 if !text.is_empty() {

@@ -9,6 +9,7 @@ mod history;
 mod mcp;
 mod limits;
 mod notes;
+mod processes;
 mod progress;
 mod push;
 mod remote;

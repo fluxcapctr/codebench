@@ -171,7 +171,20 @@ vte-terminal {{ padding: 6px 10px; }}
 .cb-board {{ padding: 18px 24px; color: {fg}; }}
 .cb-split {{ border-left: 1px solid {muted}; }}
 paned > separator {{ background: {muted}; min-width: 1px; }}
-.cb-root > separator {{ background: {muted}; min-width: 1px; }}
+.cb-root > separator, .cb-root > separator:hover, .cb-root > separator:focus, .cb-root > separator:backdrop {{ background: {muted}; min-width: 1px; box-shadow: none; outline: none; }}
+paned > separator:focus, paned > separator:hover {{ background: {muted}; box-shadow: none; outline: none; }}
+.cb-tabs {{ background: {dark}; border-bottom: 1px solid {muted}; padding: 0 4px; }}
+.cb-tab {{ padding: 4px 12px; min-height: 0; color: {muted}; background: transparent; border-bottom: 2px solid transparent; }}
+.cb-tab:hover {{ color: {fg}; background: alpha({light}, 0.6); }}
+.cb-tab.active {{ color: {fg}; background: {bg}; border-bottom-color: {accent}; }}
+.cb-views {{ background: {bg}; border-bottom: 1px solid {muted}; padding: 0 4px; }}
+.cb-view {{ padding: 3px 12px; min-height: 0; color: {muted}; background: transparent; border-bottom: 2px solid transparent; }}
+.cb-view:hover {{ color: {fg}; }}
+.cb-view.active {{ color: {accent}; border-bottom-color: {accent}; }}
+.cb-page-title {{ padding: 16px 24px 8px; }}
+.cb-page {{ padding: 0 16px 16px; background: transparent; }}
+.cb-page > row {{ padding: 6px 8px; }}
+.cb-new {{ margin-top: 6px; }}
 .cb-picker {{ background: {dark}; border: 1px solid {accent}; padding: 10px; }}
 .cb-picker-title {{ color: {accent}; font-weight: bold; margin-bottom: 6px; }}
 .cb-picker entry {{ background: {bg}; color: {fg}; border: 1px solid {muted}; padding: 4px 8px; min-height: 0; caret-color: {accent}; outline: none; }}
