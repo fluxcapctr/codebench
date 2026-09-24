@@ -191,5 +191,12 @@ fn status_line() -> String {
             }));
         }
     }
-    serde_json::json!({ "running": true, "needs": needs, "working": working, "tasks": tasks }).to_string()
+    let usage: Vec<serde_json::Value> = crate::limits::load()
+        .into_iter()
+        .map(|u| {
+            let limits: Vec<String> = u.limits.iter().map(|l| format!("{} {}%", l.name, l.percent)).collect();
+            serde_json::json!({ "agent": u.agent, "text": limits.join(" · "), "worst": u.worst().map_or(0, |l| l.percent) })
+        })
+        .collect();
+    serde_json::json!({ "running": true, "needs": needs, "working": working, "tasks": tasks, "usage": usage }).to_string()
 }

@@ -18,6 +18,7 @@ Panel {
   readonly property int needs: Number(status.needs) || 0
   readonly property int working: Number(status.working) || 0
   readonly property var tasks: status.tasks ? status.tasks : []
+  readonly property var usage: status.usage ? status.usage : []
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -177,6 +178,34 @@ Panel {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.openTask(modelData.id)
               }
+            }
+          }
+        }
+
+        // Subscription limits, worst first in red past 80%.
+        Column {
+          width: parent.width
+          spacing: Style.space(2)
+          visible: root.usage.length > 0
+          Text {
+            text: "LIMITS"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+          }
+          Repeater {
+            model: root.usage
+            Text {
+              required property var modelData
+              width: parent.width
+              elide: Text.ElideRight
+              textFormat: Text.StyledText
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              color: Number(modelData.worst) >= 80 ? root.urgent : root.fg
+              text: modelData.agent + "  <font color='" + root.dim + "'>" + modelData.text + "</font>"
             }
           }
         }

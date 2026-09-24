@@ -11,6 +11,7 @@ use crate::store::{self, Session, State};
 use crate::theme::{self, Theme};
 use crate::progress;
 use crate::usage;
+use crate::limits::{self, Usage};
 use crate::workflow::{self, Workflow};
 use crate::headless;
 use gtk::{gdk, gio, glib, pango, prelude::*};
@@ -149,6 +150,17 @@ fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<stor
     Ok(store::Worktree { path, branch, base })
 }
 
+/// "week (all models)" -> "week", "week (Fable)" -> "Fable week".
+fn short_limit(name: &str) -> String {
+    match name.split_once(" (") {
+        Some((window, rest)) => {
+            let what = rest.trim_end_matches(')');
+            if what == "all models" { window.to_string() } else { format!("{what} {window}") }
+        }
+        None => name.to_string(),
+    }
+}
+
 /// Panes that close themselves when their program exits.
 fn transient(key: &str) -> bool {
     key.starts_with("edit:") || key.starts_with("git:") || key.starts_with("auth:")
@@ -198,7 +210,20 @@ struct Picker {
 struct Running {
     term: vte::Terminal,
     pid: Cell<Option<i32>>,
+    /// For agents with no status hooks: set when you send a prompt, and
+    /// the last time the screen changed after that.
+    armed: Cell<bool>,
+    last_output: Cell<Instant>,
 }
+
+/// Agents whose status Codebench infers from screen activity: working
+/// while the screen keeps changing after a prompt, done once it settles.
+fn watches_activity(agent: &str) -> bool {
+    matches!(agent, "gemini" | "grok" | "opencode" | "agy")
+}
+
+/// How long the screen must stay still before a task counts as done.
+const SETTLE: Duration = Duration::from_secs(5);
 
 struct App {
     window: gtk::ApplicationWindow,
@@ -231,6 +256,7 @@ struct App {
     git_cache: RefCell<HashMap<String, (Instant, Option<String>)>>,
     pending_merge: RefCell<Option<(String, Instant)>>,
     accounts: RefCell<Vec<Account>>,
+    usage: RefCell<Vec<Usage>>,
     agents_label: gtk::Label,
     paned: gtk::Paned,
     side_box: gtk::Box,
@@ -480,6 +506,7 @@ impl App {
             git_cache: RefCell::default(),
             pending_merge: RefCell::default(),
             accounts: RefCell::default(),
+            usage: RefCell::new(limits::load()),
             agents_label: subs,
             paned,
             side_box,
@@ -520,6 +547,36 @@ impl App {
         }
         bench.process_requests();
         bench.refresh_accounts();
+
+        // Subscription limits: soon after start, then every ten minutes.
+        let b = bench.clone();
+        glib::timeout_add_local_once(Duration::from_secs(3), move || b.refresh_usage());
+        let b = bench.clone();
+        glib::timeout_add_seconds_local(600, move || {
+            b.refresh_usage();
+            glib::ControlFlow::Continue
+        });
+
+        // Tasks whose status comes from screen activity settle into "done".
+        let b = bench.clone();
+        glib::timeout_add_seconds_local(1, move || {
+            let settled: Vec<String> = b
+                .running
+                .borrow()
+                .iter()
+                .filter(|(_, r)| r.armed.get() && r.last_output.get().elapsed() >= SETTLE)
+                .map(|(k, r)| {
+                    r.armed.set(false);
+                    k.clone()
+                })
+                .collect();
+            for key in settled {
+                if b.status_of(&key) == Status::Working {
+                    b.set_status(&key, Status::Done);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
 
         // Scheduled workflows run inside the app while it is open.
         headless::write_pid();
@@ -609,6 +666,7 @@ impl App {
                     }
                     gdk::Key::r => {
                         b.refresh_accounts();
+                        b.refresh_usage();
                         return glib::Propagation::Stop;
                     }
                     gdk::Key::u => {
@@ -1290,7 +1348,30 @@ impl App {
             None => {
                 let term = self.new_terminal(key, agent);
                 self.stack.add_named(&term, Some(key));
-                let r = Rc::new(Running { term, pid: Cell::new(None) });
+                let r = Rc::new(Running {
+                    term,
+                    pid: Cell::new(None),
+                    armed: Cell::new(false),
+                    last_output: Cell::new(Instant::now()),
+                });
+                if watches_activity(agent) {
+                    let b = self.clone();
+                    let id = key.to_string();
+                    let run = r.clone();
+                    r.term.connect_commit(move |_, text, _| {
+                        if text.contains('\r') {
+                            run.armed.set(true);
+                            run.last_output.set(Instant::now());
+                            b.set_status(&id, Status::Working);
+                        }
+                    });
+                    let run = r.clone();
+                    r.term.connect_contents_changed(move |_| {
+                        if run.armed.get() {
+                            run.last_output.set(Instant::now());
+                        }
+                    });
+                }
                 self.running.borrow_mut().insert(key.to_string(), r.clone());
                 r
             }
@@ -1556,15 +1637,54 @@ impl App {
         });
     }
 
+    /// Checks subscription limits in the background.
+    fn refresh_usage(self: &Rc<Self>) {
+        let b = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(found) = gio::spawn_blocking(limits::check_all).await else { return };
+            if found.is_empty() {
+                return;
+            }
+            // Keep the last known numbers for an agent that did not answer.
+            let mut all = b.usage.borrow().clone();
+            for u in found {
+                all.retain(|x| x.agent != u.agent);
+                all.push(u);
+            }
+            limits::save(&all);
+            *b.usage.borrow_mut() = all;
+            b.show_accounts_summary();
+            if matches!(*b.picker.mode.borrow(), PickerMode::Accounts) {
+                b.fill_accounts();
+            }
+        });
+    }
+
+    fn usage_of(&self, agent: &str) -> Option<Usage> {
+        self.usage.borrow().iter().find(|u| u.agent == agent).cloned()
+    }
+
     fn show_accounts_summary(&self) {
         let theme = self.theme.borrow();
+        let tint = |pct: u32| match pct {
+            p if p >= 80 => theme.red.clone(),
+            p if p >= 60 => theme.yellow.clone(),
+            _ => theme.muted.clone(),
+        };
         let parts: Vec<String> = self
             .accounts
             .borrow()
             .iter()
             .filter(|a| a.installed)
             .map(|a| match a.login {
-                Login::In(_) => format!("{} <span foreground='{}'>✓</span>", a.agent, theme.green),
+                Login::In(_) => {
+                    let used = self
+                        .usage_of(a.agent)
+                        .and_then(|u| u.worst().map(|l| l.percent))
+                        .map(|p| format!(" <span foreground='{}'>{p}%</span>", tint(p)))
+                        .unwrap_or_default();
+                    format!("{} <span foreground='{}'>✓</span>{used}", a.agent, theme.green)
+                }
                 Login::Out => format!("{} <span foreground='{}'>✗</span>", a.agent, theme.red),
                 Login::Unknown(_) => format!("{} ?", a.agent),
             })
@@ -1597,7 +1717,14 @@ impl App {
                     Login::Unknown(why) => format!("? {why}"),
                 };
                 let update = a.update.as_ref().map(|(cur, new)| format!("   ↑ {cur} → {new}")).unwrap_or_default();
-                format!("{:<10}{login}{update}", a.agent)
+                let used = self
+                    .usage_of(a.agent)
+                    .map(|u| {
+                        let parts: Vec<String> = u.limits.iter().map(|l| format!("{} {}%", short_limit(&l.name), l.percent)).collect();
+                        format!("   ·  {}", parts.join(", "))
+                    })
+                    .unwrap_or_default();
+                format!("{:<10}{login}{used}{update}", a.agent)
             })
             .collect();
         if !rows.is_empty() {

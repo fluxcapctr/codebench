@@ -172,9 +172,16 @@ and two tasks never fight over one. It is off by default because its tools
 add to every task's context; the sidebar marks projects that have it with ◍.
 Needs node (`npx`); uses your installed Chromium.
 
-## Accounts and past chats
+## Accounts, limits and past chats
 
-The bottom of the sidebar shows which agents are signed in. `Ctrl+Shift+U`
+The bottom of the sidebar shows which agents are signed in, and for Claude
+and Codex how much of their tightest rate limit is used (yellow past 60%,
+red past 80%). `Ctrl+Shift+U` lists every limit: Claude's session and
+weekly limits from `claude /usage`, and Codex's 5-hour and weekly windows
+from its latest session. They refresh every ten minutes, and the bar
+widget's dropdown shows them too.
+
+The sidebar also shows which agents are signed in. `Ctrl+Shift+U`
 lists each agent's login (for Claude, the plan and organization), signs in
 with Enter, or switches account with `s` (sign out, then in), in a pane that
 closes when done. `codebench accounts` prints the same from a terminal.
@@ -210,7 +217,10 @@ subscriptions apply.
 - **Codex** reports "done" through its `notify` hook. Codebench finds the
   task's own Codex conversation by a marker in its instructions and resumes
   exactly that one.
-- Other agents report "needs you" when they ring the terminal bell.
+- Gemini, Grok, OpenCode and Antigravity have no status hooks, so Codebench
+  watches the screen: after you send a prompt the task is working while the
+  screen keeps changing, and done once it has been still for five seconds.
+  A terminal bell means it needs you.
 
 ## Files
 

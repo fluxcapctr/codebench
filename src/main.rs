@@ -5,6 +5,7 @@ mod git;
 mod headless;
 mod history;
 mod mcp;
+mod limits;
 mod notes;
 mod progress;
 mod store;
@@ -63,6 +64,10 @@ fn main() -> gtk::glib::ExitCode {
                     accounts::Login::Out => println!("{:<10}signed out{update}", a.agent),
                     accounts::Login::Unknown(w) => println!("{:<10}unknown    {w}{update}", a.agent),
                 }
+            }
+            for u in limits::check_all() {
+                let parts: Vec<String> = u.limits.iter().map(|l| format!("{} {}% (resets {})", l.name, l.percent, l.resets)).collect();
+                println!("{:<10}{}", u.agent, parts.join(", "));
             }
             std::process::exit(0);
         }
