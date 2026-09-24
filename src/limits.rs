@@ -1,6 +1,6 @@
 //! How much of each subscription's rate limits is used: Claude's from
 //! `claude /usage`, Codex's from the rate limits it records in its newest
-//! session file. Checks run the CLIs or read files, so call them off the
+//! session file, Antigravity's from `agy -p /usage`. Checks run the CLIs or read files, so call them off the
 //! main thread.
 
 use crate::store::{cache_dir, home};
@@ -49,11 +49,12 @@ fn parse_claude(text: &str) -> Vec<Limit> {
         .collect()
 }
 
-pub fn claude() -> Option<Usage> {
+/// Runs a CLI in the cache dir and returns its stdout, giving up after a minute.
+fn output(program: &str, args: &[&str]) -> Option<String> {
     let dir = cache_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let mut child = std::process::Command::new("claude")
-        .args(["-p", "--no-session-persistence", "/usage"])
+    let mut child = std::process::Command::new(program)
+        .args(args)
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -70,8 +71,57 @@ pub fn claude() -> Option<Usage> {
     }
     let mut text = String::new();
     child.stdout.take()?.read_to_string(&mut text).ok()?;
-    let limits = parse_claude(&text);
+    Some(text)
+}
+
+pub fn claude() -> Option<Usage> {
+    let limits = parse_claude(&output("claude", &["-p", "--no-session-persistence", "/usage"])?);
     (!limits.is_empty()).then(|| Usage { agent: "claude".into(), limits, as_of: crate::store::now() })
+}
+
+/// "2026-09-30T19:29:49Z" -> seconds since the epoch.
+fn parse_utc(s: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i32>().ok();
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = n(0..4)? - 1900;
+    tm.tm_mon = n(5..7)? - 1;
+    tm.tm_mday = n(8..10)?;
+    tm.tm_hour = n(11..13)?;
+    tm.tm_min = n(14..16)?;
+    tm.tm_sec = n(17..19)?;
+    let t = unsafe { libc::timegm(&mut tm) };
+    (t > 0).then_some(t as u64)
+}
+
+/// Parses `agy -p /usage`: tab-separated lines like
+/// "Gemini Models\tWeekly Limit Remaining\t96%\t2026-09-30T19:29:49Z".
+/// Antigravity reports what is left; this keeps what is used, like the others.
+fn parse_agy(text: &str) -> Vec<Limit> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split('\t');
+            let (models, window, left, resets) = (f.next()?, f.next()?, f.next()?, f.next().unwrap_or(""));
+            let left = left.trim().trim_end_matches('%').parse::<f64>().ok()?.round() as u32;
+            let models = models.trim().trim_end_matches(" Models").trim_end_matches(" models").replace(" and ", "/");
+            let window = if window.starts_with("Weekly") {
+                "week"
+            } else if window.starts_with("Five Hour") {
+                "5 hours"
+            } else {
+                window.trim().trim_end_matches(" Limit Remaining")
+            };
+            Some(Limit {
+                name: format!("{window} ({models})"),
+                percent: 100u32.saturating_sub(left),
+                resets: parse_utc(resets.trim()).map(crate::workflow::stamp).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+pub fn agy() -> Option<Usage> {
+    let limits = parse_agy(&output("agy", &["-p", "/usage"])?);
+    (!limits.is_empty()).then(|| Usage { agent: "agy".into(), limits, as_of: crate::store::now() })
 }
 
 fn find_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
@@ -155,11 +205,12 @@ pub fn load() -> Vec<Usage> {
     std::fs::read(file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-/// Both checks, in parallel.
+/// All checks, in parallel.
 pub fn check_all() -> Vec<Usage> {
     let c = std::thread::spawn(claude);
     let x = std::thread::spawn(codex);
-    [c.join().ok().flatten(), x.join().ok().flatten()].into_iter().flatten().collect()
+    let a = std::thread::spawn(agy);
+    [c.join().ok().flatten(), x.join().ok().flatten(), a.join().ok().flatten()].into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -176,6 +227,17 @@ mod tests {
         assert_eq!(limits.len(), 2);
         assert_eq!((limits[0].name.as_str(), limits[0].percent), ("session", 9));
         assert_eq!(limits[1].resets, "Sep 26, 12:59pm");
+    }
+
+    #[test]
+    fn reads_agy_usage() {
+        let text = "Gemini Models\tWeekly Limit Remaining\t96%\t2026-09-30T19:29:49Z\n\
+            Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-24T22:54:44Z\n";
+        let limits = parse_agy(text);
+        assert_eq!(limits.len(), 2);
+        assert_eq!((limits[0].name.as_str(), limits[0].percent), ("week (Gemini)", 4));
+        assert_eq!((limits[1].name.as_str(), limits[1].percent), ("5 hours (Claude/GPT)", 0));
+        assert_eq!(parse_utc("2026-09-30T19:29:49Z"), Some(1790796589));
     }
 
     #[test]

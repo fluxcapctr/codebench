@@ -19,6 +19,7 @@ let watching = null;
 let fit = localStorage.getItem("cb.fit") !== "off";
 let tab = "chat";
 let chatTimer = null;
+let renders = 0;
 
 // ---------------------------------------------------------------- helpers
 
@@ -122,6 +123,14 @@ function connect() {
   };
 }
 
+// The task whose screen this phone follows; null stops following.
+function watch(id) {
+  if (watching === id) return false;
+  watching = id;
+  if (socket?.readyState === 1) socket.send(JSON.stringify({ watch: id }));
+  return true;
+}
+
 function reloadTheme() {
   const link = $('link[href^="/theme.css"]');
   link.href = "/theme.css?" + Date.now();
@@ -138,6 +147,7 @@ window.addEventListener("hashchange", render);
 back.addEventListener("click", () => history.length > 1 ? history.back() : go("#/"));
 
 function render() {
+  renders++;
   if (!token) return pairView();
   const [, route, arg] = (location.hash || "#/").split("/");
   if (route === "task" && arg) return taskView(decodeURIComponent(arg));
@@ -161,7 +171,7 @@ function taskRow(p, t) {
 }
 
 function inboxView() {
-  watching = null;
+  watch(null);
   title.textContent = "codebench";
   back.hidden = true;
   view.replaceChildren();
@@ -212,6 +222,11 @@ function showScreen(html) {
     pre.style.fontSize = Math.max(6, 14 * scale) + "px";
   }
   if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+// A screen fetched for a task shows only while that task is still open.
+function loadScreen(id) {
+  return api(`/api/task/${encodeURIComponent(id)}/screen`).then(r => { if (watching === id) showScreen(r.html); });
 }
 
 async function keys(task, list) {
@@ -268,7 +283,7 @@ function setTab(which) {
   $(".chat").hidden = which !== "chat";
   $(".screen").hidden = which !== "screen";
   if (which === "chat") loadChat();
-  else api(`/api/task/${encodeURIComponent(watching)}/screen`).then(r => showScreen(r.html));
+  else loadScreen(watching).catch(() => {});
 }
 
 function statusParts(id, p, t) {
@@ -278,7 +293,7 @@ function statusParts(id, p, t) {
     localStorage.setItem("cb.fit", fit ? "on" : "off");
     $(".screen")?.classList.toggle("fit", fit);
     $(".status").replaceChildren(...statusParts(id, p, t));
-    api(`/api/task/${encodeURIComponent(id)}/screen`).then(r => showScreen(r.html));
+    loadScreen(id).catch(() => {});
   };
   return [
     h("span", { class: color }, glyph + " " + (word || t?.kind || "")),
@@ -292,15 +307,16 @@ function taskView(id) {
   const [p, t] = taskById(id);
   back.hidden = false;
   title.textContent = t ? t.title : "task";
-  if (watching !== id) {
-    watching = id;
-    if (socket?.readyState === 1) socket.send(JSON.stringify({ watch: id }));
+  if (watch(id)) {
     api(`/api/task/${encodeURIComponent(id)}/open`, {}).catch(e => toast(e.message));
   }
   // Keep the typed reply and scroll across live re-renders.
   const draft = $(".reply textarea")?.value || "";
   if ($(".task") && $(".task").dataset.id === id) {
     $(".status").replaceChildren(...statusParts(id, p, t));
+    // Opened before the task list arrived: chat shows up once it does.
+    const tabs = $(".tabs");
+    if (tabs?.hidden && hasChat(t)) { tabs.hidden = false; setTab("chat"); }
     return;
   }
   const [glyph, color, word] = LOOK[t?.kind] || LOOK.idle;
@@ -323,28 +339,50 @@ function taskView(id) {
   tab = hasChat(t) ? "chat" : "screen";
   view.replaceChildren(h("div", { class: "task", "data-id": id },
     h("div", { class: "status" }, ...statusParts(id, p, t)),
-    hasChat(t) ? h("div", { class: "tabs" },
+    h("div", { class: "tabs", hidden: !hasChat(t) },
       h("button", { "data-tab": "chat", onclick: () => setTab("chat") }, "chat"),
-      h("button", { "data-tab": "screen", onclick: () => setTab("screen") }, "screen")) : null,
+      h("button", { "data-tab": "screen", onclick: () => setTab("screen") }, "screen")),
     chat,
     screen,
     h("div", { class: "keys" },
       k("yes ✓", ["enter"], "ok"), k("no ✗", ["esc"], "no"), k("↑", ["up"]), k("↓", ["down"]), k("1", ["1"]), k("2", ["2"]),
       k("tab", ["tab"]), k("⇧tab", ["shift-tab"]), k("⏎", ["enter"]), k("esc", ["esc"]), k("3", ["3"]), k("^C", ["ctrl-c"])),
     h("div", { class: "reply" }, reply, h("button", { class: "primary", onclick: sendReply }, "send"))));
-  api(`/api/task/${encodeURIComponent(id)}/screen`).then(r => showScreen(r.html)).catch(e => toast(e.message));
+  loadScreen(id).catch(e => toast(e.message));
   setTab(tab);
 }
 
 // ---------------------------------------------------------------- new task
 
+// Refills a select only when its choices changed, keeping the choice made.
+function setOptions(select, items, fallback) {
+  const key = JSON.stringify(items);
+  if (select.dataset.items === key) return;
+  const keep = select.value || fallback;
+  select.dataset.items = key;
+  select.replaceChildren(...items.map(([value, label]) => h("option", { value, selected: value === keep || undefined }, label)));
+}
+
 function newView(pid) {
-  watching = null;
+  watch(null);
   back.hidden = false;
   title.textContent = "new task";
-  const projects = state?.projects || [];
-  const project = h("select", {}, projects.map(p => h("option", { value: p.id, selected: p.id === pid || undefined }, p.name)));
-  const agent = h("select", {}, (state?.agents || ["claude"]).map(a => h("option", { value: a }, a)));
+  const projectItems = (state?.projects || []).map(p => [p.id, p.name]);
+  const agentItems = (state?.agents || ["claude"]).map(a => [a, a]);
+  // Live updates refresh the choices, never the form being filled in.
+  const open = $(".newtask");
+  if (open && open.dataset.pid === pid) {
+    const [project, agent] = open.querySelectorAll("select");
+    const was = project.value;
+    setOptions(project, projectItems, pid);
+    setOptions(agent, agentItems);
+    if (project.value !== was) project.onchange?.();
+    return;
+  }
+  const project = h("select", {});
+  setOptions(project, projectItems, pid);
+  const agent = h("select", {});
+  setOptions(agent, agentItems);
   const name = h("input", { placeholder: "task name (optional)" });
   const prompt = h("textarea", { placeholder: "what should the agent do?" });
   const flows = h("div", {});
@@ -369,9 +407,9 @@ function newView(pid) {
           h("div", { class: "s" }, [w.agent, w.schedule, w.from].filter(Boolean).join(" · ")))));
     }
   };
-  project.addEventListener("change", loadFlows);
+  project.onchange = loadFlows;
   loadFlows();
-  view.replaceChildren(h("div", { class: "form" },
+  view.replaceChildren(h("div", { class: "form newtask", "data-pid": pid },
     h("label", {}, "project", project),
     h("label", {}, "agent", agent),
     h("label", {}, "name", name),
@@ -389,12 +427,15 @@ function newView(pid) {
 // ---------------------------------------------------------------- artifacts
 
 async function artifactsView() {
-  watching = null;
+  const mine = renders;
+  watch(null);
   back.hidden = false;
   title.textContent = "artifacts";
   view.replaceChildren(h("div", { class: "empty" }, "loading…"));
   let r;
-  try { r = await api("/api/artifacts"); } catch (e) { toast(e.message); return; }
+  try { r = await api("/api/artifacts"); } catch (e) { if (mine === renders) toast(e.message); return; }
+  // Another page may be showing by now.
+  if (mine !== renders) return;
   if (!r.artifacts.length) {
     view.replaceChildren(h("div", { class: "empty" }, "no artifacts yet. ask an agent to show you something."));
     return;
@@ -437,7 +478,7 @@ async function turnOnPush() {
 }
 
 async function settingsView() {
-  watching = null;
+  watch(null);
   back.hidden = false;
   title.textContent = "settings";
   const status = h("span", { class: "accent" }, "…");

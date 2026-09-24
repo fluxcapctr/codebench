@@ -157,7 +157,8 @@ window, .cb-root {{ background: {bg}; color: {fg}; }}
 .cb-sidebar {{ background: {dark}; border-right: 1px solid {muted}; }}
 .cb-brand {{ color: {accent}; font-weight: bold; padding: 10px 12px 6px 12px; }}
 list, list > row {{ background: transparent; color: {fg}; }}
-list > row {{ padding: 6px 12px; min-height: 0; outline: none; }}
+list > row {{ padding: 7px 12px; min-height: 0; outline: none; }}
+list > row label {{ padding-top: 1px; }}
 list > row:hover {{ background: alpha({light}, 0.6); }}
 list > row:selected {{ background: {selection}; color: {fg}; }}
 list > row:selected label {{ color: {fg}; }}

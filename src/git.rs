@@ -30,6 +30,12 @@ pub fn is_repo(dir: &Path) -> bool {
     git(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|s| s == "true")
 }
 
+/// Whether HEAD points at a commit. A fresh `git init` has none yet, and a
+/// worktree cannot be made until it does.
+pub fn has_commit(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_ok()
+}
+
 pub fn branch(dir: &Path) -> Option<String> {
     git(dir, &["branch", "--show-current"]).ok().filter(|b| !b.is_empty())
 }
@@ -51,6 +57,9 @@ pub fn ahead(repo: &Path, base: &str, branch: &str) -> Option<(usize, usize)> {
 /// Returns the branch it started from.
 pub fn add_worktree(repo: &Path, dir: &Path, branch: &str) -> Result<String, String> {
     let base = self::branch(repo).ok_or("the project is not on a branch")?;
+    if !has_commit(repo) {
+        return Err(format!("{base} has no commits yet. Commit something first to give tasks their own worktree"));
+    }
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -126,6 +135,23 @@ mod tests {
         remove_worktree(&repo, &wt, "cb/task");
         assert!(!wt.exists());
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn new_repositories_need_a_commit_for_worktrees() {
+        let dir = std::env::temp_dir().join(format!("cb-git-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).unwrap();
+        assert!(is_repo(&dir) && !has_commit(&dir));
+        let err = add_worktree(&dir, &dir.with_extension("wt"), "cb/probe").unwrap_err();
+        assert!(err.contains("no commits"), "{err}");
+        assert!(!dir.with_extension("wt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!has_commit(&dir));
+        let full = repo("has-commit");
+        assert!(has_commit(&full));
+        std::fs::remove_dir_all(full).unwrap();
     }
 
     #[test]

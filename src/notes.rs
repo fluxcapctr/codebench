@@ -138,21 +138,80 @@ pub fn obsidian_uri(file: &Path) -> String {
     format!("obsidian://open?path={}", url_encode(&file.to_string_lossy()))
 }
 
-/// Copies the brief and handoffs into a newly linked folder, without
-/// overwriting anything already there.
-pub fn carry_over(from: &Path, to: &Path) {
-    let _ = std::fs::create_dir_all(to.join("handoffs"));
-    for rel in ["brief.md"] {
-        let (src, dst) = (from.join(rel), to.join(rel));
-        if src.is_file() && !dst.exists() {
-            let _ = std::fs::copy(src, dst);
+/// Points the project's notes at `to`, first copying everything from the
+/// current folder across and moving workflow run records along. Leaves the
+/// project unchanged if the copy fails. Returns what was left behind, as in
+/// `carry_over`.
+pub fn relink(project: &mut Project, to: &Path) -> Result<Vec<PathBuf>, String> {
+    let from = project.notes_dir();
+    let left = carry_over(&from, to)?;
+    let (old, new) = (from.join("workflows"), to.join("workflows"));
+    crate::workflow::rebase_runs(&old, &new);
+    for s in project.sessions.iter_mut() {
+        if let Some(rel) = s.workflow.as_ref().and_then(|w| w.strip_prefix(&old).ok()) {
+            s.workflow = Some(new.join(rel));
         }
     }
-    for entry in std::fs::read_dir(from.join("handoffs")).into_iter().flatten().flatten() {
-        let dst = to.join("handoffs").join(entry.file_name());
-        if !dst.exists() {
-            let _ = std::fs::copy(entry.path(), dst);
+    project.notes = Some(to.to_path_buf());
+    Ok(left)
+}
+
+/// Copies the whole notes folder into a newly linked one without replacing
+/// anything already there. Returns the paths, relative to the folder, left
+/// behind: names the new folder already uses for something different, and
+/// linked folders.
+pub fn carry_over(from: &Path, to: &Path) -> Result<Vec<PathBuf>, String> {
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    std::fs::create_dir_all(to.join("handoffs")).map_err(|e| err(to, e))?;
+    let target = to.canonicalize().map_err(|e| err(to, e))?;
+    if from.canonicalize().is_ok_and(|f| f == target) {
+        return Ok(Vec::new());
+    }
+    let mut left = Vec::new();
+    let mut dirs = vec![PathBuf::new()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(from.join(&dir)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir.as_os_str().is_empty() => break,
+            other => other.map_err(|e| err(&from.join(&dir), e))?,
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| err(&from.join(&dir), e))?;
+            let rel = dir.join(entry.file_name());
+            let (src, dst) = (from.join(&rel), to.join(&rel));
+            let link = entry.file_type().map_err(|e| err(&src, e))?.is_symlink();
+            let Ok(meta) = std::fs::metadata(&src) else {
+                left.push(rel);
+                continue;
+            };
+            if meta.is_dir() {
+                if link {
+                    left.push(rel);
+                } else if src.canonicalize().is_ok_and(|c| c != target) {
+                    std::fs::create_dir_all(&dst).map_err(|e| err(&dst, e))?;
+                    dirs.push(rel);
+                }
+            } else if dst.symlink_metadata().is_ok() {
+                if !same_contents(&src, &dst) {
+                    left.push(rel);
+                }
+            } else {
+                crate::artifacts::copy_file_safely(&src, &dst)?;
+                if let Ok(modified) = meta.modified()
+                    && let Ok(file) = std::fs::File::options().write(true).open(&dst)
+                {
+                    let _ = file.set_modified(modified);
+                }
+            }
         }
+    }
+    left.sort();
+    Ok(left)
+}
+
+fn same_contents(a: &Path, b: &Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -178,15 +237,68 @@ mod tests {
         let vault = root.join("vault");
         let (from, to) = (root.join("old"), vault.join("Projects/app"));
         std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
-        std::fs::create_dir_all(from.join("handoffs")).unwrap();
-        std::fs::write(from.join("brief.md"), "brief").unwrap();
-        std::fs::write(from.join("handoffs/a.md"), "a").unwrap();
+        let files = ["brief.md", "handoffs/a.md", "custom.md", "workflows/check.md", "runs/result.md", "artifacts/chart.html"];
+        for rel in files {
+            std::fs::create_dir_all(from.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(from.join(rel), format!("old {rel}")).unwrap();
+        }
+        std::fs::create_dir_all(to.join("runs")).unwrap();
+        std::fs::write(to.join("runs/result.md"), "theirs").unwrap();
+        std::fs::write(to.join("custom.md"), "old custom.md").unwrap();
 
-        carry_over(&from, &to);
-        assert_eq!(std::fs::read_to_string(to.join("brief.md")).unwrap(), "brief");
-        assert!(to.join("handoffs/a.md").is_file());
+        assert_eq!(carry_over(&from, &to).unwrap(), vec![PathBuf::from("runs/result.md")]);
+        for rel in files.iter().filter(|r| **r != "runs/result.md") {
+            assert_eq!(std::fs::read_to_string(to.join(rel)).unwrap(), format!("old {rel}"));
+        }
+        assert_eq!(std::fs::read_to_string(to.join("runs/result.md")).unwrap(), "theirs");
+        assert_eq!(std::fs::read_to_string(from.join("brief.md")).unwrap(), "old brief.md");
         assert_eq!(vault_root(&to), Some(vault));
         assert_eq!(vault_root(&from), None);
+
+        // A new folder inside the old one is not copied into itself.
+        let inner = from.join("inner");
+        assert!(carry_over(&from, &inner).unwrap().is_empty());
+        assert!(inner.join("workflows/check.md").is_file() && !inner.join("inner").exists());
+        assert!(carry_over(&from, &from).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relinking_keeps_workflow_runs() {
+        let root = std::env::temp_dir().join(format!("cb-relink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (from, to) = (root.join("old"), root.join("new"));
+        std::fs::create_dir_all(from.join("workflows")).unwrap();
+        std::fs::write(from.join("workflows/check.md"), "Do it.").unwrap();
+        let mut project = Project {
+            id: "p".into(),
+            name: "p".into(),
+            path: root.clone(),
+            sessions: vec![Session {
+                id: "s".into(),
+                agent: "claude".into(),
+                title: "check".into(),
+                created: 0,
+                launched: true,
+                prompt: None,
+                archived: false,
+                workflow: Some(from.join("workflows/check.md")),
+                worktree: None,
+                codex_id: None,
+            }],
+            notes: Some(from.clone()),
+            browser: false,
+        };
+        relink(&mut project, &to).unwrap();
+        assert_eq!(project.notes_dir(), to);
+        assert_eq!(project.sessions[0].workflow.as_deref(), Some(to.join("workflows/check.md").as_path()));
+        assert!(to.join("workflows/check.md").is_file());
+
+        // A failed copy leaves the project where it was.
+        let blocked = root.join("file");
+        std::fs::write(&blocked, "").unwrap();
+        assert!(relink(&mut project, &blocked.join("notes")).is_err());
+        assert_eq!(project.notes_dir(), to);
         std::fs::remove_dir_all(root).unwrap();
     }
 

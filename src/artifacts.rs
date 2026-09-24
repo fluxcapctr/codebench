@@ -100,17 +100,61 @@ pub fn save(project: &Project, title: &str, kind: Option<&str>, content: Option<
     let dest = dir(project);
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     match (content, from) {
-        (Some(text), _) => std::fs::write(dest.join(&file), text).map_err(|e| e.to_string())?,
+        (Some(text), _) => write_replacing(&dest.join(&file), |tmp| std::fs::write(tmp, text))?,
         (None, Some(path)) => {
             let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
             if meta.len() > 50 * 1024 * 1024 {
                 return Err("that file is over 50 MB".into());
             }
-            std::fs::copy(path, dest.join(&file)).map_err(|e| e.to_string())?;
+            copy_file_safely(path, &dest.join(&file))?;
         }
         (None, None) => return Err("give content or a path".into()),
     }
     Ok(file)
+}
+
+/// Whether two paths name the same file, through symlinks and hard links.
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Copies `src` over `dst` through a temporary file beside it, so readers
+/// never see a half-written file. Copying a file onto itself (or an alias of
+/// it) does nothing. Returns whether anything was copied.
+pub fn copy_file_safely(src: &std::path::Path, dst: &std::path::Path) -> Result<bool, String> {
+    if same_file(src, dst) {
+        return Ok(false);
+    }
+    write_replacing(dst, |tmp| std::fs::copy(src, tmp).map(|_| ())).map_err(|e| format!("{}: {e}", src.display()))?;
+    Ok(true)
+}
+
+/// `dst`, or the first free "name (2).ext", "name (3).ext"... beside it.
+pub fn free_name(dst: &std::path::Path) -> PathBuf {
+    let stem = dst.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = dst.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut path = dst.to_path_buf();
+    let mut n = 2;
+    while path.symlink_metadata().is_ok() {
+        path = dst.with_file_name(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    path
+}
+
+fn write_replacing(dst: &std::path::Path, fill: impl FnOnce(&std::path::Path) -> std::io::Result<()>) -> Result<(), String> {
+    let name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let nanos = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let tmp = dst.with_file_name(format!(".{name}.{}-{nanos}.tmp", std::process::id()));
+    let result = fill(&tmp).and_then(|_| std::fs::rename(&tmp, dst));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("{}: {e}", dst.display()))
 }
 
 // ── server ─────────────────────────────────────────────────────────────────
@@ -293,5 +337,62 @@ mod tests {
         assert_eq!(safe_name(".hidden.html"), None);
         assert_eq!(safe_name("notes.txt"), None);
         assert_eq!(kind_of("Diagram.MMD"), Some("mermaid"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cb-art-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copying_a_file_onto_itself_keeps_it() {
+        let dir = scratch("self");
+        let file = dir.join("chart.html");
+        std::fs::write(&file, "<h1>keep me</h1>").unwrap();
+        std::os::unix::fs::symlink(&file, dir.join("link.html")).unwrap();
+        std::fs::hard_link(&file, dir.join("hard.html")).unwrap();
+        assert!(!copy_file_safely(&file, &file).unwrap());
+        assert!(!copy_file_safely(&dir.join("link.html"), &file).unwrap());
+        assert!(!copy_file_safely(&dir.join("hard.html"), &file).unwrap());
+        assert!(!copy_file_safely(&file, &dir.join("link.html")).unwrap());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "<h1>keep me</h1>");
+
+        let other = dir.join("other.html");
+        std::fs::write(&other, "new").unwrap();
+        assert!(copy_file_safely(&other, &file).unwrap());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new");
+        assert!(copy_file_safely(&dir.join("missing"), &file).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4, "no temp files left behind");
+        assert_eq!(free_name(&file), dir.join("chart (2).html"));
+        assert_eq!(free_name(&dir.join("fresh.md")), dir.join("fresh.md"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn showing_an_artifact_from_its_own_path_keeps_it() {
+        let root = scratch("show");
+        let project = Project {
+            id: "p".into(),
+            name: "p".into(),
+            path: root.clone(),
+            sessions: Vec::new(),
+            notes: Some(root.join("notes")),
+            browser: false,
+        };
+        save(&project, "chart", Some("html"), Some("<h1>keep me</h1>"), None).unwrap();
+        let file = dir(&project).join("chart.html");
+        assert_eq!(save(&project, "chart", None, None, Some(&file)).unwrap(), "chart.html");
+        let alias = root.join("alias.html");
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
+        save(&project, "chart", None, None, Some(&alias)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "<h1>keep me</h1>");
+        std::fs::write(root.join("v2.html"), "v2").unwrap();
+        save(&project, "chart", None, None, Some(&root.join("v2.html"))).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

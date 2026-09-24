@@ -76,6 +76,10 @@ impl Project {
 pub struct State {
     #[serde(default)]
     pub projects: Vec<Project>,
+    /// Why state.json could not be read. While set, saving is refused so the
+    /// file is not replaced by this empty state.
+    #[serde(skip)]
+    pub load_error: Option<String>,
 }
 
 /// Agents can hand MCP servers a trimmed environment, so `codebench mcp`
@@ -133,29 +137,92 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+static SAVE_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The last failed `save`, if one has not been reported yet.
+pub fn take_save_error() -> Option<String> {
+    SAVE_ERROR.lock().unwrap_or_else(|p| p.into_inner()).take()
+}
+
 impl State {
     fn file() -> PathBuf {
         config_dir().join("state.json")
     }
 
+    /// The saved state. A missing file is a fresh start; one that cannot be
+    /// read or parsed is an error, after a copy of it has been kept.
+    pub fn try_load() -> Result<State, String> {
+        Self::read(&Self::file())
+    }
+
+    fn read(file: &Path) -> Result<State, String> {
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(e) => return Err(format!("could not read {}: {e}", file.display())),
+        };
+        serde_json::from_slice(&bytes).map_err(|e| {
+            let err = format!("{} is not valid: {e}", file.display());
+            match Self::keep_copy(file, &bytes) {
+                Ok(copy) => format!("{err}. A copy is kept at {}", copy.display()),
+                Err(e) => format!("{err}. Could not keep a copy: {e}"),
+            }
+        })
+    }
+
+    /// Like `try_load`, but an unreadable file gives an empty state that
+    /// refuses to save over it; `load_error` says why.
     pub fn load() -> State {
-        std::fs::read_to_string(Self::file())
+        Self::try_load().unwrap_or_else(|e| State { load_error: Some(e), ..State::default() })
+    }
+
+    /// Copies unparseable state aside once per version of the file.
+    fn keep_copy(file: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+        let modified = std::fs::metadata(file)
+            .and_then(|m| m.modified())
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(now(), |d| d.as_secs());
+        let copy = file.with_extension(format!("json.corrupt-{modified}"));
+        if std::fs::read(&copy).is_ok_and(|b| b == bytes) {
+            return Ok(copy);
+        }
+        std::fs::write(&copy, bytes).map_err(|e| format!("{}: {e}", copy.display()))?;
+        Ok(copy)
+    }
+
+    /// Accepts starting over after a failed load; the kept copy stays.
+    pub fn start_fresh(&mut self) {
+        self.load_error = None;
     }
 
     /// Writes through a temp file so a crash mid-write never truncates state.
-    pub fn save(&self) {
-        let file = Self::file();
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    pub fn try_save(&self) -> Result<(), String> {
+        self.write(&Self::file())
+    }
+
+    fn write(&self, file: &Path) -> Result<(), String> {
+        if let Some(err) = &self.load_error {
+            return Err(format!("not saving over state that failed to load: {err}"));
         }
-        let tmp = file.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(self)
-            && std::fs::write(&tmp, json).is_ok()
-        {
-            let _ = std::fs::rename(&tmp, &file);
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, file));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result.map_err(|e| format!("could not save {}: {e}", file.display()))
+    }
+
+    /// `try_save` for callers with nowhere to show an error; the window
+    /// picks the error up with `take_save_error`.
+    pub fn save(&self) {
+        if let Err(e) = self.try_save() {
+            eprintln!("codebench: {e}");
+            *SAVE_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
         }
     }
 
@@ -216,5 +283,55 @@ impl State {
         });
         self.save();
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_state_is_kept_and_never_saved_over() {
+        let dir = std::env::temp_dir().join(format!("cb-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("state.json");
+        let state = State::read(&file).unwrap();
+        assert!(state.projects.is_empty() && state.load_error.is_none());
+
+        let broken = "{broken but potentially recoverable";
+        std::fs::write(&file, broken).unwrap();
+        assert!(State::read(&file).is_err());
+        let mut state = State::read(&file).unwrap_or_else(|e| State { load_error: Some(e), ..State::default() });
+        state.projects.push(Project {
+            id: "p".into(),
+            name: "p".into(),
+            path: dir.clone(),
+            sessions: Vec::new(),
+            notes: None,
+            browser: false,
+        });
+        assert!(state.write(&file).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+        let copies: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"))
+            .collect();
+        assert_eq!(copies.len(), 1, "one copy however often it is loaded");
+        assert_eq!(std::fs::read_to_string(copies[0].path()).unwrap(), broken);
+
+        state.start_fresh();
+        state.write(&file).unwrap();
+        assert_eq!(State::read(&file).unwrap().projects.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_state_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("cb-state-dir-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("state.json")).unwrap();
+        assert!(State::read(&dir.join("state.json")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -51,7 +51,7 @@ codebench ~/code/some-project   # add a folder as a project and open it
 | `Ctrl+Shift+J` | Open the brief in Obsidian (asks for a vault folder first if the notes are not in one) |
 | `Ctrl+Shift+R` | Rename the task or project (the folder keeps its name) |
 | `Ctrl+Shift+W` | Stop the task's agent (select it again to resume) |
-| `Ctrl+Shift+D` | Delete the task, or remove the project (press twice) |
+| `Ctrl+Shift+D` | Delete the task, or remove the project (asks first) |
 | `Ctrl+Shift+A` | Show or hide handed-off tasks |
 | `Ctrl+Shift+K` | Give this project's agents a browser (on or off) |
 | `Ctrl+Shift+Y` | Phone access: on or off, its address, paired phones |

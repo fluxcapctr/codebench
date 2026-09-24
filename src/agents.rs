@@ -21,6 +21,9 @@ pub const AGENTS: &[Agent] = &[
     Agent { id: "gemini", label: "Gemini CLI", program: "gemini" },
     Agent { id: "grok", label: "Grok Build", program: "grok" },
     Agent { id: "opencode", label: "OpenCode", program: "opencode" },
+    Agent { id: "cursor", label: "Cursor", program: "cursor-agent" },
+    // OpenCode pointed at the models Ollama serves on this machine.
+    Agent { id: "local", label: "Local (Ollama)", program: "opencode" },
     Agent { id: "agy", label: "Antigravity", program: "agy" },
     Agent { id: "shell", label: "Shell", program: "" },
 ];
@@ -39,6 +42,7 @@ pub fn installed() -> Vec<&'static Agent> {
     AGENTS
         .iter()
         .filter(|a| a.program.is_empty() || on_path(a.program))
+        .filter(|a| a.id != "local" || on_path("ollama"))
         .collect()
 }
 
@@ -161,7 +165,11 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
             if resume {
                 argv.extend([s("--resume"), session.id.clone()]);
             } else {
-                argv.extend([s("--session-id"), session.id.clone(), s("-n"), session.title.clone()]);
+                argv.extend([s("--session-id"), session.id.clone()]);
+                // A made-up "task 3" would stop Claude naming it itself.
+                if !crate::history::is_placeholder(&session.title) {
+                    argv.extend([s("-n"), session.title.clone()]);
+                }
             }
             let mut mcp = serde_json::json!({
                 "mcpServers": { "codebench": { "type": "stdio", "command": mcp_cmd, "args": mcp_args, "env": mcp_env } }
@@ -227,9 +235,106 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
             }
             argv
         }
+        "opencode" | "local" => {
+            // These start fresh each launch, so the task's own prompt is only
+            // for the first.
+            let prompt = extra.or(if session.launched { None } else { session.prompt.as_deref() });
+            let config = opencode_config(session, project, &context, session.agent == "local");
+            let mut argv = vec![s("env"), format!("OPENCODE_CONFIG_CONTENT={config}"), s("opencode")];
+            if let Some(prompt) = prompt {
+                argv.extend([s("--prompt"), prompt.to_string()]);
+            }
+            argv
+        }
+        "cursor" => {
+            let prompt = extra.or(if session.launched { None } else { session.prompt.as_deref() });
+            let mut argv = vec![s("cursor-agent"), s("--add-dir"), project.notes_dir().to_string_lossy().into_owned()];
+            argv.extend(prompt.map(str::to_string));
+            argv
+        }
+        "gemini" | "grok" | "agy" => {
+            let prompt = extra.or(if session.launched { None } else { session.prompt.as_deref() });
+            let mut argv = vec![get(&session.agent).map_or("", |a| a.program).to_string()];
+            match (session.agent.as_str(), prompt) {
+                (_, None) => {}
+                ("grok", Some(p)) => argv.extend([s("--"), p.to_string()]),
+                // The `=` form keeps a prompt starting with "-" a value.
+                (_, Some(p)) => argv.push(format!("--prompt-interactive={p}")),
+            }
+            argv
+        }
         "shell" => vec![shell()],
         other => vec![get(other).map(|a| a.program).unwrap_or(other).to_string()],
     }
+}
+
+/// OpenCode config layered on the user's own through
+/// `OPENCODE_CONFIG_CONTENT`: the Codebench tools, the project context and,
+/// for `local`, an Ollama provider serving every model Ollama has pulled.
+fn opencode_config(session: &Session, project: &Project, context: &str, local: bool) -> String {
+    let (cmd, args, env) = mcp_server(session);
+    let mut command = vec![cmd];
+    command.extend(args);
+    let mut config = serde_json::json!({
+        "mcp": { "codebench": { "type": "local", "command": command, "environment": env } },
+    });
+    if project.browser {
+        let (cmd, args, env) = browser_server(session);
+        let mut command = vec![cmd];
+        command.extend(args);
+        config["mcp"]["browser"] = serde_json::json!({ "type": "local", "command": command, "environment": env });
+    }
+    // OpenCode takes extra instructions as files, not text.
+    let file = store::cache_dir().join("context").join(format!("{}.md", session.id));
+    if std::fs::create_dir_all(file.parent().unwrap()).is_ok() && std::fs::write(&file, context).is_ok() {
+        config["instructions"] = serde_json::json!([file]);
+    }
+    if local {
+        let models = ollama_models();
+        let entries: serde_json::Map<_, _> = models
+            .iter()
+            .map(|m| (m.clone(), serde_json::json!({ "name": m, "limit": { "context": 32768, "output": 8192 } })))
+            .collect();
+        config["provider"] = serde_json::json!({
+            "ollama": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Ollama",
+                "options": { "baseURL": format!("{}/v1", ollama_host()) },
+                "models": entries,
+            }
+        });
+        if let Some(model) = default_local_model(&models) {
+            config["model"] = format!("ollama/{model}").into();
+        }
+    }
+    config.to_string()
+}
+
+fn ollama_host() -> String {
+    match std::env::var("OLLAMA_HOST") {
+        Ok(h) if h.starts_with("http") => h.trim_end_matches('/').to_string(),
+        Ok(h) if !h.is_empty() => format!("http://{h}"),
+        _ => "http://localhost:11434".into(),
+    }
+}
+
+/// The models Ollama has pulled, as `ollama list` names them.
+pub fn ollama_models() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("ollama").arg("list").output() else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// `CODEBENCH_LOCAL_MODEL` if set, else the first coding model, else the
+/// first model. Others stay a `/models` away inside OpenCode.
+fn default_local_model(models: &[String]) -> Option<String> {
+    std::env::var("CODEBENCH_LOCAL_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .or_else(|| models.iter().find(|m| m.contains("coder")).or(models.first()).cloned())
 }
 
 fn codex_marker(task: &str) -> String {
@@ -340,7 +445,13 @@ fn toml_inline_table(map: &serde_json::Map<String, serde_json::Value>) -> String
 /// Whether a stopped task can be started with a message as its prompt, even
 /// when resuming.
 pub fn takes_prompt_on_resume(agent: &str) -> bool {
-    agent == "claude"
+    matches!(agent, "claude" | "opencode" | "local" | "cursor" | "gemini" | "grok" | "agy")
+}
+
+/// Whether `argv` can start the agent with an opening prompt. Only the
+/// shell cannot; starting one for a workflow or prompt would drop it.
+pub fn takes_opening_prompt(agent: &str) -> bool {
+    get(agent).is_some_and(|a| a.id != "shell")
 }
 
 /// Agents that can write a handoff note and start from an opening prompt.
@@ -356,4 +467,47 @@ pub fn reports_done(agent: &str) -> bool {
 
 pub fn status_file(dir: &Path, session: &str) -> PathBuf {
     dir.join(session)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_prompts_reach_every_agent() {
+        let root = std::env::temp_dir().join(format!("cb-agents-{}", std::process::id()));
+        let project = Project {
+            id: "p".into(),
+            name: "p".into(),
+            path: root.clone(),
+            sessions: Vec::new(),
+            notes: Some(root.join("notes")),
+            browser: false,
+        };
+        let session = |agent: &str, launched: bool| Session {
+            id: "probe".into(),
+            agent: agent.into(),
+            title: "probe".into(),
+            created: 0,
+            launched,
+            prompt: Some("-UNIQUE_OPENING_PROMPT".into()),
+            archived: false,
+            workflow: None,
+            worktree: None,
+            codex_id: None,
+        };
+        let count = |argv: &[String], text: &str| argv.iter().filter(|v| v.contains(text)).count();
+        for (agent, program) in [("gemini", "gemini"), ("grok", "grok"), ("agy", "agy")] {
+            let argv = argv(&session(agent, false), &project, None);
+            assert_eq!(argv[0], program);
+            assert_eq!(count(&argv, "UNIQUE_OPENING_PROMPT"), 1, "{argv:?}");
+            let expected = if agent == "grok" { "-UNIQUE_OPENING_PROMPT" } else { "--prompt-interactive=-UNIQUE_OPENING_PROMPT" };
+            assert_eq!(argv.last().unwrap(), expected);
+            assert_eq!(super::argv(&session(agent, true), &project, None), vec![program.to_string()]);
+            assert_eq!(count(&super::argv(&session(agent, true), &project, Some("LATER")), "LATER"), 1);
+            assert!(takes_opening_prompt(agent) && takes_prompt_on_resume(agent));
+        }
+        assert!(!takes_opening_prompt("shell") && !takes_opening_prompt("nope"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

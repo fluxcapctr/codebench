@@ -66,6 +66,7 @@ pub fn update_command(agent: &str) -> Option<String> {
         "grok" => Some("grok update".into()),
         "opencode" => Some("opencode upgrade".into()),
         "agy" => Some("agy update".into()),
+        "cursor" => Some("cursor-agent update".into()),
         _ => None,
     }
 }
@@ -138,6 +139,17 @@ pub fn check(agent: &'static str) -> Account {
             }
             None => Login::Unknown("opencode auth list failed".into()),
         },
+        "cursor" => match run("cursor-agent", &["status"]) {
+            Some(t) if t.to_lowercase().contains("not logged in") => Login::Out,
+            Some(t) if t.to_lowercase().contains("logged in") => Login::In(
+                t.lines().find(|l| l.to_lowercase().contains("logged in")).unwrap_or("").trim().to_string(),
+            ),
+            _ => Login::Unknown("cursor-agent status failed".into()),
+        },
+        "local" => match agents::ollama_models().len() {
+            0 => Login::Unknown("no Ollama models pulled".into()),
+            n => Login::In(format!("{n} Ollama models")),
+        },
         "agy" => match run("agy", &["models"]) {
             Some(t) if t.lines().any(|l| l.contains('\t')) => Login::In("Google account".into()),
             Some(t) if t.to_lowercase().contains("sign in") || t.to_lowercase().contains("log in") => Login::Out,
@@ -185,6 +197,7 @@ pub fn login_command(agent: &str, switch: bool) -> Option<String> {
         "codex" => ("codex login", Some("codex logout")),
         "grok" => ("grok --no-auto-update login", Some("grok --no-auto-update logout")),
         "opencode" => ("opencode auth login", Some("opencode auth logout")),
+        "cursor" => ("cursor-agent login", Some("cursor-agent logout")),
         // These sign in from inside their own TUI (/auth, /logout).
         "gemini" => ("echo 'Use /auth inside Gemini to sign in or switch accounts.'; gemini", None),
         "agy" => ("echo 'Use /logout, then sign in again, inside Antigravity.'; agy", None),

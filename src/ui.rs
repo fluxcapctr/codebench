@@ -117,6 +117,7 @@ enum Action {
     Sidebar,
     Files,
     TopBars,
+    Search,
 }
 
 const ACTIONS: &[(&str, &str, Action)] = &[
@@ -137,9 +138,10 @@ const ACTIONS: &[(&str, &str, Action)] = &[
     ("Ctrl+Shift+K", "give this project's agents a browser (on or off)", Action::Browser),
     ("Ctrl+Shift+S", "split: pin this task on the right, pick another for the left", Action::Split),
     ("Ctrl+Shift+W", "stop task (select it again to resume)", Action::Stop),
-    ("Ctrl+Shift+D", "delete task or remove project (press twice)", Action::Delete),
+    ("Ctrl+Shift+D", "delete task or remove project", Action::Delete),
     ("Ctrl+Shift+A", "show or hide handed-off tasks", Action::Archived),
     ("Ctrl+Shift+B", "show or hide the sidebar", Action::Sidebar),
+    ("Alt+/", "filter this project's tasks by name (Enter opens the first, Esc clears)", Action::Search),
     ("Ctrl+Shift+T", "show or hide the project tabs and view bar", Action::TopBars),
 ];
 
@@ -164,6 +166,8 @@ enum Status {
     Idle,
     Working,
     Waiting,
+    /// Waiting, but you have already looked at it.
+    WaitingSeen,
     Done,
     Exited,
 }
@@ -186,6 +190,7 @@ impl Status {
             Status::Idle => ("●", &t.muted, ""),
             Status::Working => ("●", &t.yellow, "working"),
             Status::Waiting => ("●", &t.red, "needs you"),
+            Status::WaitingSeen => ("●", &t.muted, "waiting"),
             Status::Done => ("✓", &t.green, "done"),
             Status::Exited => ("×", &t.muted, "stopped"),
         }
@@ -210,6 +215,7 @@ impl Status {
             Status::Idle => "idle",
             Status::Working => "working",
             Status::Waiting => "waiting on the user",
+            Status::WaitingSeen => "waiting, seen",
             Status::Done => "done",
             Status::Exited => "stopped",
         }
@@ -424,7 +430,7 @@ struct Running {
 /// Agents whose status Codebench infers from screen activity: working
 /// while the screen keeps changing after a prompt, done once it settles.
 fn watches_activity(agent: &str) -> bool {
-    matches!(agent, "gemini" | "grok" | "opencode" | "agy")
+    matches!(agent, "gemini" | "grok" | "opencode" | "local" | "cursor" | "agy")
 }
 
 /// Width a task gets when opened from the phone and not on the desktop.
@@ -440,9 +446,13 @@ struct App {
     css: gtk::CssProvider,
     sidebar_box: gtk::Box,
     sidebar: gtk::ListBox,
+    /// Narrows the task list by name; hidden until used.
+    search: gtk::SearchEntry,
     rows: RefCell<Vec<Row>>,
     rebuilding: Cell<bool>,
     show_archived: Cell<bool>,
+    /// Tasks whose name is being worked out right now.
+    naming: RefCell<std::collections::HashSet<String>>,
     stack: gtk::Stack,
     empty: gtk::Label,
     header_left: gtk::Label,
@@ -453,6 +463,8 @@ struct App {
     /// Terminals by key: a session id, or `notes:<project id>`.
     running: RefCell<HashMap<String, Rc<Running>>>,
     status: RefCell<HashMap<String, Status>>,
+    /// Holds off sleep and idle while any agent is working.
+    awake: RefCell<crate::awake::Awake>,
     context: RefCell<HashMap<String, u64>>,
     /// Sessions asked to write a handoff note, and where.
     handoffs: RefCell<HashMap<String, PathBuf>>,
@@ -472,6 +484,12 @@ struct App {
     side_holder: gtk::Box,
     /// The task shown on the right of a split.
     pinned: RefCell<Option<String>>,
+    /// A board refresh is queued; later changes ride along with it.
+    board_pending: Cell<bool>,
+    /// Bumped per board read, so a slow older read never lands last.
+    board_gen: Cell<u32>,
+    /// The task whose terminal last took keyboard focus.
+    focused: RefCell<Option<String>>,
     board: gtk::Label,
     /// The phone server, while phone access is on.
     remote: RefCell<Option<Rc<Remote>>>,
@@ -495,19 +513,20 @@ struct App {
     editor_gen: Cell<u32>,
     /// Set while loading a file, so loading is not taken as an edit.
     editor_loading: Cell<bool>,
+    /// Typed into since the last load or save.
+    editor_dirty: Cell<bool>,
+    /// The file's text as last loaded or saved, to notice outside edits.
+    editor_disk: RefCell<Option<String>>,
     /// The task you last looked at in each project, reopened with its tab.
     last_task: RefCell<HashMap<String, String>>,
     /// A handle on the app itself, for widgets built outside Rc methods.
     me: RefCell<std::rc::Weak<App>>,
-    /// Holds off suspend while any agent is working.
-    keep_awake: RefCell<Option<std::process::Child>>,
     current_project: RefCell<Option<String>>,
     /// Terminal key of the row on screen, if it has one.
     current_key: RefCell<Option<String>>,
     status_dir: PathBuf,
     monitors: RefCell<Vec<gio::FileMonitor>>,
     reload_pending: Cell<bool>,
-    pending_delete: RefCell<Option<(String, Instant)>>,
 }
 
 pub fn run() -> glib::ExitCode {
@@ -518,6 +537,7 @@ pub fn run() -> glib::ExitCode {
         let b = b.unwrap_or_else(|| {
             let b = App::build(app);
             *bench.borrow_mut() = Some(b.clone());
+            b.watch_state_errors();
             b
         });
         // `codebench <dir>` adds the folder as a project and opens it, also
@@ -581,6 +601,66 @@ fn label(class: &str) -> gtk::Label {
     l
 }
 
+/// Claude Code's little pixel mascot, drawn in the theme's colors (FG and BG).
+const CLAUDE_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 11 11" shape-rendering="crispEdges"><g fill="FG"><rect x="2" y="1" width="7" height="6"/><rect x="0" y="3" width="11" height="2"/><rect x="2" y="7" width="1" height="2"/><rect x="4" y="7" width="1" height="2"/><rect x="6" y="7" width="1" height="2"/><rect x="8" y="7" width="1" height="2"/></g><g fill="BG"><rect x="3" y="2" width="1" height="2"/><rect x="7" y="2" width="1" height="2"/></g></svg>"##;
+
+/// Codex's cloud with a prompt, drawn in the theme's colors (FG and BG).
+const CODEX_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24"><g fill="FG"><circle cx="8" cy="13" r="6"/><circle cx="13" cy="9" r="6.5"/><circle cx="17" cy="14" r="5"/><rect x="8" y="13" width="9" height="6"/></g><g fill="none" stroke="BG" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 11l3 2.5-3 2.5"/><path d="M13 16h4"/></g></svg>"##;
+
+/// Antigravity's arch, drawn in the theme's colors (FG).
+const AGY_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24"><path fill="FG" d="M12 2C7.6 2 5.5 9 3 17c-.8 2.6-.4 4.2 1.2 4.6 1.8.4 2.9-1.2 3.9-3.6C9.3 15 10.4 13 12 13s2.7 2 3.9 5c1 2.4 2.1 4 3.9 3.6 1.6-.4 2-2 1.2-4.6C18.5 9 16.4 2 12 2z"/></svg>"##;
+
+/// A computer monitor for the local model, drawn in the theme's colors (FG and BG).
+const LOCAL_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24"><g fill="FG"><rect x="1" y="3" width="22" height="15" rx="2"/><rect x="10" y="18" width="4" height="3"/><rect x="6" y="20" width="12" height="2" rx="1"/></g><rect x="3" y="5" width="18" height="11" fill="BG"/></svg>"##;
+
+/// A small logo for an agent, or None to show its name instead.
+fn agent_icon(agent: &str, theme: &Theme) -> Option<gdk::Texture> {
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, gdk::Texture>> = RefCell::default();
+    }
+    let svg = match agent {
+        "claude" => CLAUDE_ICON,
+        "codex" => CODEX_ICON,
+        "agy" => AGY_ICON,
+        "local" => LOCAL_ICON,
+        _ => return None,
+    };
+    // Both in the text color, so they follow the Omarchy theme.
+    let svg = svg.replace("FG", &theme.foreground).replace("BG", &theme.background);
+    CACHE.with_borrow_mut(|cache| {
+        if let Some(t) = cache.get(&svg) {
+            return Some(t.clone());
+        }
+        let t = gdk::Texture::from_bytes(&glib::Bytes::from(svg.as_bytes())).ok()?;
+        cache.insert(svg, t.clone());
+        Some(t)
+    })
+}
+
+/// A task row: status glyph, the agent's logo (or name), then the rest.
+fn task_row(glyph: &str, agent: &str, rest: &str, theme: &Theme) -> gtk::ListBoxRow {
+    let Some(icon) = agent_icon(agent, theme) else {
+        return row_with(&format!("{glyph} <span foreground='{}'>{:<8}</span>{rest}", theme.muted, esc(agent)));
+    };
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    let g = gtk::Label::new(None);
+    g.set_markup(glyph);
+    let image = gtk::Image::from_paintable(Some(&icon));
+    image.set_pixel_size(14);
+    image.set_tooltip_text(agents::get(agent).map(|a| a.label));
+    let l = gtk::Label::new(None);
+    l.set_xalign(0.0);
+    l.set_hexpand(true);
+    l.set_ellipsize(pango::EllipsizeMode::End);
+    l.set_markup(rest);
+    line.append(&g);
+    line.append(&image);
+    line.append(&l);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&line));
+    row
+}
+
 fn row_with(markup: &str) -> gtk::ListBoxRow {
     let l = gtk::Label::new(None);
     l.set_xalign(0.0);
@@ -603,6 +683,13 @@ impl App {
                 gtk::STYLE_PROVIDER_PRIORITY_USER,
             );
         }
+        // GTK's automatic font rendering places text at fractional pixels, which
+        // smears the one-pixel top bar of capitals like E and T across two dim
+        // rows. Snap font metrics to whole pixels so strokes land crisply.
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_font_rendering(gtk::FontRendering::Manual);
+            settings.set_gtk_hint_font_metrics(true);
+        }
 
         let window = gtk::ApplicationWindow::new(app);
         window.set_title(Some("codebench"));
@@ -624,6 +711,11 @@ impl App {
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_box.add_css_class("cb-sidebar");
         sidebar_box.set_width_request(160);
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("filter tasks"));
+        search.add_css_class("cb-search");
+        search.set_visible(false);
+        sidebar_box.append(&search);
         let sidebar = gtk::ListBox::new();
         sidebar.set_selection_mode(gtk::SelectionMode::Single);
         let scroller = gtk::ScrolledWindow::new();
@@ -637,9 +729,16 @@ impl App {
         let tabbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         tabbar.add_css_class("cb-tabs");
         let tabs_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        tabs_box.set_hexpand(true);
+        // Many projects scroll sideways instead of widening the window.
+        let tabs_scroll = gtk::ScrolledWindow::new();
+        tabs_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        tabs_scroll.set_propagate_natural_height(true);
+        tabs_scroll.set_hexpand(true);
+        tabs_scroll.set_child(Some(&tabs_box));
         let subs = label("cb-dim");
         subs.set_margin_end(10);
+        subs.set_ellipsize(pango::EllipsizeMode::End);
+        subs.set_max_width_chars(40);
         subs.set_text(&format!(
             "agents: {}",
             agents::installed()
@@ -649,7 +748,7 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-        tabbar.append(&tabs_box);
+        tabbar.append(&tabs_scroll);
         tabbar.append(&subs.clone());
 
         // The current project's views.
@@ -792,9 +891,11 @@ impl App {
             css,
             sidebar_box,
             sidebar,
+            search,
             rows: RefCell::default(),
             rebuilding: Cell::new(false),
             show_archived: Cell::new(false),
+            naming: RefCell::default(),
             stack,
             empty,
             header_left,
@@ -804,6 +905,7 @@ impl App {
             picker,
             running: RefCell::default(),
             status: RefCell::default(),
+            awake: RefCell::new(crate::awake::Awake::new()),
             context: RefCell::default(),
             handoffs: RefCell::default(),
             inbox: RefCell::default(),
@@ -818,7 +920,9 @@ impl App {
             side_header,
             side_holder,
             pinned: RefCell::default(),
-            keep_awake: RefCell::default(),
+            focused: RefCell::default(),
+            board_pending: Cell::new(false),
+            board_gen: Cell::new(0),
             artifact_server: artifacts::Server::start().ok(),
             viewers: RefCell::default(),
             tabs_box,
@@ -833,6 +937,8 @@ impl App {
             editor_path: RefCell::default(),
             editor_gen: Cell::new(0),
             editor_loading: Cell::new(false),
+            editor_dirty: Cell::new(false),
+            editor_disk: RefCell::default(),
             last_task: RefCell::default(),
             me: RefCell::default(),
             board,
@@ -843,7 +949,6 @@ impl App {
             status_dir,
             monitors: RefCell::default(),
             reload_pending: Cell::new(false),
-            pending_delete: RefCell::default(),
         });
         *bench.me.borrow_mut() = Rc::downgrade(&bench);
         bench.connect();
@@ -875,6 +980,15 @@ impl App {
             bench.start_remote();
         }
 
+        // Tasks named "task N", or by the old first-words rule, from before.
+        let b = bench.clone();
+        glib::timeout_add_local_once(Duration::from_secs(2), move || {
+            let ids: Vec<String> = b.state.borrow().projects.iter().flat_map(|p| &p.sessions).map(|s| s.id.clone()).collect();
+            for id in ids {
+                b.name_task(&id);
+            }
+        });
+
         // Subscription limits: soon after start, then every ten minutes.
         let b = bench.clone();
         glib::timeout_add_local_once(Duration::from_secs(3), move || b.refresh_usage());
@@ -902,6 +1016,7 @@ impl App {
                     b.set_status(&key, Status::Done);
                 }
             }
+            b.update_keep_awake();
             glib::ControlFlow::Continue
         });
 
@@ -956,12 +1071,16 @@ impl App {
             if mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
                 return glib::Propagation::Proceed;
             }
-            if !matches!(key.to_lower(), gdk::Key::e | gdk::Key::x | gdk::Key::Delete) {
-                return glib::Propagation::Proceed;
-            }
             let idx = b.page_list.selected_row().map(|r| r.index()).unwrap_or(-1);
             let alt = b.page_items.borrow().get(idx as usize).and_then(|i| i.alt.clone());
-            match alt {
+            // Each alternate action answers only to its own documented key,
+            // so an edit key can never stop a process.
+            let fits = match &alt {
+                Some(PageAct::Edit(_)) => key.to_lower() == gdk::Key::e,
+                Some(PageAct::StopProcess(_)) => matches!(key.to_lower(), gdk::Key::x | gdk::Key::Delete),
+                _ => false,
+            };
+            match alt.filter(|_| fits) {
                 Some(act) => {
                     b.run_page_act(act);
                     glib::Propagation::Stop
@@ -977,6 +1096,7 @@ impl App {
             if b.editor_loading.get() {
                 return;
             }
+            b.editor_dirty.set(true);
             let generation = b.editor_gen.get().wrapping_add(1);
             b.editor_gen.set(generation);
             let b2 = b.clone();
@@ -997,11 +1117,57 @@ impl App {
         });
         self.stack.add_controller(drop);
 
+        let b = self.clone();
+        self.search.connect_search_changed(move |_| b.rebuild_sidebar());
+        let b = self.clone();
+        self.search.connect_activate(move |_| b.open_first_match());
+        let b = self.clone();
+        self.search.connect_stop_search(move |_| b.close_search());
+        // Down from the box walks the filtered list.
+        let search_keys = gtk::EventControllerKey::new();
+        let b = self.clone();
+        search_keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Down {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(row) = b.sidebar.selected_row().or_else(|| b.sidebar.row_at_index(0)) {
+                row.grab_focus();
+            }
+            glib::Propagation::Stop
+        });
+        self.search.add_controller(search_keys);
+        // "/" in the task list starts filtering too.
+        let list_keys = gtk::EventControllerKey::new();
+        let b = self.clone();
+        list_keys.connect_key_pressed(move |_, key, _, mods| {
+            if key == gdk::Key::slash && !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
+                b.open_search();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.sidebar.add_controller(list_keys);
+
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let b = self.clone();
         keys.connect_key_pressed(move |_, key, _, mods| b.on_key(key, mods));
         self.window.add_controller(keys);
+
+        // Leaving the editor any way at all saves it and lets go of the file.
+        let b = self.clone();
+        self.stack.connect_visible_child_name_notify(move |st| {
+            if st.visible_child_name().as_deref() != Some("editor") {
+                b.close_editor();
+            }
+        });
+        let b = self.clone();
+        self.window.connect_close_request(move |_| {
+            b.save_editor();
+            // Closing stops every task, so nothing is left to stay awake for.
+            b.awake.borrow_mut().release();
+            glib::Propagation::Proceed
+        });
 
         let b = self.clone();
         self.window.connect_is_active_notify(move |w| {
@@ -1148,6 +1314,34 @@ impl App {
         });
     }
 
+    /// Gives a task still called "task N", or just the start of its first
+    /// prompt, a name that says what it is about. Works in the background.
+    fn name_task(self: &Rc<Self>, key: &str) {
+        let Some(s) = self.state.borrow().session(key).map(|(_, s)| s.clone()) else { return };
+        if !s.launched || !self.naming.borrow_mut().insert(key.to_string()) {
+            return;
+        }
+        let b = self.clone();
+        let key = key.to_string();
+        glib::spawn_future_local(async move {
+            let before = s.title.clone();
+            let found = gio::spawn_blocking(move || history::auto_name(&s)).await.ok().flatten();
+            b.naming.borrow_mut().remove(&key);
+            let Some(title) = found else { return };
+            {
+                let mut state = b.state.borrow_mut();
+                // Renamed by hand meanwhile: leave it.
+                let Some(s) = state.session_mut(&key).filter(|s| s.title == before) else { return };
+                s.title = title;
+                state.save();
+            }
+            b.rebuild_sidebar();
+            if b.current_key.borrow().as_deref() == Some(key.as_str()) {
+                b.update_header();
+            }
+        });
+    }
+
     // ── sidebar ────────────────────────────────────────────────────────────
 
     fn status_of(&self, key: &str) -> Status {
@@ -1184,6 +1378,8 @@ impl App {
         let state = self.state.borrow();
         let context = self.context.borrow();
         let show_archived = self.show_archived.get();
+        let query = self.search.text().to_lowercase();
+        let words: Vec<&str> = query.split_whitespace().collect();
         let current = self.current_project.borrow().clone();
         let me = self.me.borrow().upgrade();
         let mut rows = Vec::new();
@@ -1201,13 +1397,29 @@ impl App {
             let number = if i < 9 { format!("<span alpha='50%'>{}</span> ", i + 1) } else { String::new() };
             let l = gtk::Label::new(None);
             l.set_markup(&format!("{number}{}{web}{badge}", esc(&p.name)));
+            l.set_ellipsize(pango::EllipsizeMode::End);
+            l.set_max_width_chars(24);
             let tab = gtk::Button::new();
             tab.set_child(Some(&l));
+            tab.set_tooltip_text(Some(&p.name));
             tab.set_has_frame(false);
             tab.set_focus_on_click(false);
             tab.add_css_class("cb-tab");
             if current.as_deref() == Some(p.id.as_str()) {
                 tab.add_css_class("active");
+                // Scroll the active tab into view once it is laid out.
+                let (t, bx) = (tab.clone(), self.tabs_box.clone());
+                glib::idle_add_local_once(move || {
+                    let Some(scroll) = bx.parent().and_then(|v| v.parent()).and_downcast::<gtk::ScrolledWindow>() else { return };
+                    let Some(r) = t.compute_bounds(&bx) else { return };
+                    let adj = scroll.hadjustment();
+                    let (x, w) = (r.x() as f64, r.width() as f64);
+                    if x < adj.value() {
+                        adj.set_value(x);
+                    } else if x + w > adj.value() + adj.page_size() {
+                        adj.set_value(x + w - adj.page_size());
+                    }
+                });
             }
             if let Some(me) = me.clone() {
                 let pid = p.id.clone();
@@ -1255,7 +1467,16 @@ impl App {
 
         // The current project's tasks.
         if let Some(p) = current.as_deref().and_then(|id| state.project(id)) {
-            for s in p.sessions.iter().filter(|s| show_archived || !s.archived) {
+            // While filtering, handed-off tasks count too: an old task is
+            // often the one you are looking for.
+            let shown = |s: &&Session| {
+                if words.is_empty() {
+                    return show_archived || !s.archived;
+                }
+                let hay = format!("{} {}", s.title, s.agent).to_lowercase();
+                words.iter().all(|w| hay.contains(w))
+            };
+            for s in p.sessions.iter().filter(shown) {
                 let (glyph, color, word) = self.status_of(&s.id).look(&theme);
                 let word = if word.is_empty() {
                     String::new()
@@ -1294,17 +1515,26 @@ impl App {
                     }
                     None => title,
                 };
-                self.sidebar.append(&row_with(&format!(
-                    "<span foreground='{color}'>{glyph}</span> <span foreground='{}'>{:<8}</span>{title}{tokens}{word}",
-                    theme.muted,
-                    esc(&s.agent),
-                )));
+                self.sidebar.append(&task_row(
+                    &format!("<span foreground='{color}'>{glyph}</span>"),
+                    &s.agent,
+                    &format!("{title}{tokens}{word}"),
+                    &theme,
+                ));
                 rows.push(Row::Session(s.id.clone()));
             }
-            let new = row_with(&format!("<span foreground='{}'>+ new task</span>   <span alpha='50%'>^⇧N</span>", theme.muted));
-            new.add_css_class("cb-new");
-            self.sidebar.append(&new);
-            rows.push(Row::NewTask(p.id.clone()));
+            if words.is_empty() {
+                let new = row_with(&format!("<span foreground='{}'>+ new task</span>   <span alpha='50%'>^⇧N</span>", theme.muted));
+                new.add_css_class("cb-new");
+                self.sidebar.append(&new);
+                rows.push(Row::NewTask(p.id.clone()));
+            } else if rows.is_empty() {
+                let none = row_with(&format!("<span foreground='{}'>no tasks match</span>", theme.muted));
+                none.set_selectable(false);
+                none.set_activatable(false);
+                self.sidebar.append(&none);
+                rows.push(Row::NewTask(p.id.clone()));
+            }
         }
 
         let snapshot = state
@@ -1351,6 +1581,40 @@ impl App {
                 me.show_view(View::Notes);
             }
             Row::NewTask(_) => {}
+        }
+    }
+
+    fn open_search(&self) {
+        self.sidebar_box.set_visible(true);
+        self.search.set_visible(true);
+        self.search.grab_focus();
+    }
+
+    /// Clears and hides the filter, back to the task you were in.
+    fn close_search(&self) {
+        let had_text = !self.search.text().is_empty();
+        self.search.set_text("");
+        self.search.set_visible(false);
+        if had_text {
+            self.rebuild_sidebar();
+        }
+        if let Some(t) = self.current_term() {
+            t.grab_focus();
+        }
+    }
+
+    fn open_first_match(self: &Rc<Self>) {
+        let first = self.rows.borrow().iter().find_map(|r| match r {
+            Row::Session(sid) => Some(sid.clone()),
+            _ => None,
+        });
+        let Some(sid) = first else { return };
+        self.search.set_text("");
+        self.search.set_visible(false);
+        self.rebuild_sidebar();
+        self.select(&Row::Session(sid.clone()));
+        if let Some(t) = self.running.borrow().get(&sid).map(|r| r.term.clone()) {
+            t.grab_focus();
         }
     }
 
@@ -1402,14 +1666,25 @@ impl App {
         };
         let _ = std::fs::create_dir_all(&dest);
         let mut copied = 0;
+        let mut failed = Vec::new();
         for f in files.iter().filter(|f| f.is_file()) {
-            if let Some(name) = f.file_name()
-                && std::fs::copy(f, dest.join(name)).is_ok()
-            {
-                copied += 1;
+            let Some(name) = f.file_name() else { continue };
+            // Never over an existing file: a same-named one gets a new name,
+            // and the file itself (or an identical copy) is left alone.
+            let want = dest.join(name);
+            if artifacts::same_file(f, &want) || std::fs::read(&want).ok() == std::fs::read(f).ok() {
+                continue;
+            }
+            match artifacts::copy_file_safely(f, &artifacts::free_name(&want)) {
+                Ok(_) => copied += 1,
+                Err(e) => failed.push(format!("{}: {e}", name.to_string_lossy())),
             }
         }
-        self.flash(&format!("copied {copied} file{} into {}", if copied == 1 { "" } else { "s" }, tilde(&dest)));
+        let mut msg = format!("copied {copied} file{} into {}", if copied == 1 { "" } else { "s" }, tilde(&dest));
+        if !failed.is_empty() {
+            msg.push_str(&format!(" · failed: {}", failed.join(", ")));
+        }
+        self.flash(&msg);
         let view = self.view.get();
         self.show_view(view);
         copied > 0
@@ -1709,7 +1984,13 @@ impl App {
         let Some(p) = self.state.borrow().project(pid).cloned() else { return };
         *self.current_project.borrow_mut() = Some(pid.to_string());
         *self.current_key.borrow_mut() = None;
-        self.board.set_markup(&self.board_markup(&p, &HashMap::new()));
+        let generation = self.board_gen.get().wrapping_add(1);
+        self.board_gen.set(generation);
+        // Keep what the board shows until the fresh read lands, so a
+        // refresh does not blank plans for a moment.
+        if self.stack.visible_child_name().as_deref() != Some("project") {
+            self.board.set_markup(&self.board_markup(&p, &HashMap::new()));
+        }
         self.stack.set_visible_child_name("project");
         self.update_header();
 
@@ -1733,8 +2014,11 @@ impl App {
             else {
                 return;
             };
-            // Only if the page is still showing this project.
-            let showing = b.current_key.borrow().is_none() && b.current_project.borrow().as_deref() == Some(pid.as_str());
+            // Only if the page is still showing this project, and no newer
+            // read has started since.
+            let showing = b.board_gen.get() == generation
+                && b.current_key.borrow().is_none()
+                && b.current_project.borrow().as_deref() == Some(pid.as_str());
             let project = b.state.borrow().project(&pid).cloned();
             if let (true, Some(project)) = (showing, project) {
                 b.board.set_markup(&b.board_markup(&project, &found));
@@ -1942,13 +2226,19 @@ impl App {
         });
     }
 
-    /// Clears "done" on the task you are looking at.
+    /// Clears "done" and "needs you" on the task you are looking at.
     fn mark_seen(&self) {
         let Some(key) = self.current_key.borrow().clone() else { return };
-        if self.window.is_active() && self.status_of(&key) == Status::Done {
-            self.status.borrow_mut().insert(key, Status::Idle);
-            self.rebuild_sidebar();
+        if !self.window.is_active() {
+            return;
         }
+        let seen = match self.status_of(&key) {
+            Status::Done => Status::Idle,
+            Status::Waiting => Status::WaitingSeen,
+            _ => return,
+        };
+        self.status.borrow_mut().insert(key, seen);
+        self.rebuild_sidebar();
     }
 
     fn update_header(&self) {
@@ -2048,6 +2338,11 @@ impl App {
         term.set_mouse_autohide(true);
         term.set_allow_hyperlink(true);
         term.set_scroll_on_keystroke(true);
+        let focus = gtk::EventControllerFocus::new();
+        let b = self.clone();
+        let k = key.to_string();
+        focus.connect_enter(move |_| *b.focused.borrow_mut() = Some(k.clone()));
+        term.add_controller(focus);
 
         // Dropping files types their paths in, quoted, like a terminal does.
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
@@ -2115,7 +2410,10 @@ impl App {
         // Feed the screen to a phone that is looking at this task.
         let b = self.clone();
         let id = key.to_string();
-        term.connect_contents_changed(move |_| b.schedule_screen(&id));
+        term.connect_contents_changed(move |_| {
+            b.schedule_screen(&id);
+            b.refresh_board(Duration::from_secs(5));
+        });
         term
     }
 
@@ -2247,11 +2545,16 @@ impl App {
             let id = key.to_string();
             glib::timeout_add_local_once(Duration::from_millis(1500), move || {
                 b.refresh_context(&id);
+                b.name_task(&id);
                 b.rebuild_sidebar();
             });
         }
         let visible = self.window.is_active() && self.current_key.borrow().as_deref() == Some(key);
-        let status = if status == Status::Done && visible { Status::Idle } else { status };
+        let status = match status {
+            Status::Done if visible => Status::Idle,
+            Status::Waiting if visible => Status::WaitingSeen,
+            s => s,
+        };
         let prev = self.status.borrow_mut().insert(key.to_string(), status);
         if prev == Some(status) && status != Status::Idle {
             return;
@@ -2277,40 +2580,37 @@ impl App {
         if self.current_key.borrow().as_deref() == Some(key) {
             self.update_header();
         }
+        self.refresh_board(Duration::from_millis(500));
         self.update_keep_awake();
     }
 
-    /// While any agent is working, a systemd-inhibit lock stops the machine
-    /// from suspending. The screen can still lock. The lock ends with the
-    /// app, since it waits on our process id.
+    fn board_showing(&self) -> Option<String> {
+        let on_board = self.current_key.borrow().is_none() && self.stack.visible_child_name().as_deref() == Some("project");
+        if on_board { self.current_project.borrow().clone() } else { None }
+    }
+
+    /// Redraws the project board, if it is showing, once `after` passes.
+    /// Changes in the meantime share that one redraw, so a busy terminal
+    /// does not rescan transcripts on every line.
+    fn refresh_board(self: &Rc<Self>, after: Duration) {
+        if self.board_pending.get() || self.board_showing().is_none() {
+            return;
+        }
+        self.board_pending.set(true);
+        let b = self.clone();
+        glib::timeout_add_local_once(after, move || {
+            b.board_pending.set(false);
+            if let Some(pid) = b.board_showing() {
+                b.show_project(&pid);
+            }
+        });
+    }
+
+    /// While any agent is working, and for a grace period after, the
+    /// machine does not sleep or idle-lock. See `awake`.
     fn update_keep_awake(&self) {
         let working = self.status.borrow().values().any(|s| *s == Status::Working);
-        let mut lock = self.keep_awake.borrow_mut();
-        match (working, lock.is_some()) {
-            (true, false) => {
-                *lock = std::process::Command::new("systemd-inhibit")
-                    .args([
-                        "--what=sleep",
-                        "--who=Codebench",
-                        "--why=Agents are working",
-                        "--mode=block",
-                        "tail",
-                        &format!("--pid={}", std::process::id()),
-                        "-f",
-                        "/dev/null",
-                    ])
-                    .stdin(std::process::Stdio::null())
-                    .spawn()
-                    .ok();
-            }
-            (false, true) => {
-                if let Some(mut child) = lock.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-            _ => {}
-        }
+        self.awake.borrow_mut().update(working);
     }
 
     fn notify(&self, sid: &str, status: Status) {
@@ -2330,8 +2630,20 @@ impl App {
         }
     }
 
+    /// The task keys act on: the pinned right side when its terminal has
+    /// focus, otherwise the left selection.
+    fn focused_key(&self) -> Option<String> {
+        let focused = self.focused.borrow().clone();
+        if let Some(k) = focused
+            && self.pinned.borrow().as_deref() == Some(k.as_str())
+        {
+            return Some(k);
+        }
+        self.current_key.borrow().clone()
+    }
+
     fn current_term(&self) -> Option<vte::Terminal> {
-        let key = self.current_key.borrow().clone()?;
+        let key = self.focused_key()?;
         self.running.borrow().get(&key).map(|r| r.term.clone())
     }
 
@@ -2340,7 +2652,8 @@ impl App {
     /// Asks the current task's agent to write a handoff note. When it
     /// finishes, `finish_handoff` moves the task to a fresh session.
     fn start_handoff(self: &Rc<Self>) {
-        let Some(Row::Session(sid)) = self.selected_row() else {
+        let pinned = self.focused_key().filter(|k| self.pinned.borrow().as_deref() == Some(k.as_str()));
+        let Some(Row::Session(sid)) = pinned.map(Row::Session).or_else(|| self.selected_row()) else {
             self.flash("select a task to hand off");
             return;
         };
@@ -2467,7 +2780,8 @@ impl App {
             .accounts
             .borrow()
             .iter()
-            .filter(|a| a.installed)
+            // Signed-out agents are not in use, and local has no limits.
+            .filter(|a| a.installed && a.agent != "local" && !matches!(a.login, Login::Out))
             .map(|a| match a.login {
                 Login::In(_) => {
                     let used = self
@@ -2477,8 +2791,7 @@ impl App {
                         .unwrap_or_default();
                     format!("{} <span foreground='{}'>✓</span>{used}", a.agent, theme.green)
                 }
-                Login::Out => format!("{} <span foreground='{}'>✗</span>", a.agent, theme.red),
-                Login::Unknown(_) => format!("{} ?", a.agent),
+                _ => format!("{} ?", a.agent),
             })
             .collect();
         self.agents_label.set_markup(&format!("{}   F2", parts.join("  ")));
@@ -2760,7 +3073,7 @@ impl App {
         let Some(remote) = self.remote.borrow().clone() else { return };
         let kind = |sid: &str| match self.status_of(sid) {
             Status::Waiting | Status::Done => "needs",
-            Status::Working => "working",
+            Status::Working | Status::WaitingSeen => "working",
             Status::Idle => "idle",
             Status::Dormant | Status::Exited => "stopped",
         };
@@ -3265,17 +3578,12 @@ impl App {
     /// Opens a note or workflow in the built-in editor: type, it saves as
     /// you go, Esc goes back.
     fn edit_file(self: &Rc<Self>, project: &store::Project, path: &Path) {
-        self.save_editor();
+        self.close_editor();
         *self.return_to.borrow_mut() = self.selected_row();
         *self.current_project.borrow_mut() = Some(project.id.clone());
         *self.current_key.borrow_mut() = Some(format!("note:{}", path.display()));
         *self.editor_path.borrow_mut() = Some(path.to_path_buf());
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        self.editor_loading.set(true);
-        let buffer = self.editor.buffer();
-        buffer.set_text(&text);
-        buffer.place_cursor(&buffer.end_iter());
-        self.editor_loading.set(false);
+        self.load_editor(path);
         self.stack.set_visible_child_name("editor");
         self.editor.grab_focus();
         self.header_left.set_markup(&format!(
@@ -3288,17 +3596,78 @@ impl App {
         self.header_right.set_text("saves as you type · esc back · ^O open in your editor");
     }
 
-    /// Writes the editor's text to its file if it changed.
-    fn save_editor(&self) {
-        let Some(path) = self.editor_path.borrow().clone() else { return };
+    fn load_editor(&self, path: &Path) {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        self.editor_loading.set(true);
         let buffer = self.editor.buffer();
-        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
-        if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+        buffer.set_text(&text);
+        buffer.place_cursor(&buffer.end_iter());
+        self.editor_loading.set(false);
+        self.editor_dirty.set(false);
+        *self.editor_disk.borrow_mut() = Some(text);
+    }
+
+    /// Saves pending edits and lets go of the file, so later navigation
+    /// never writes it again.
+    fn close_editor(self: &Rc<Self>) {
+        self.save_editor();
+        if !self.editor_dirty.get() {
+            *self.editor_path.borrow_mut() = None;
+            *self.editor_disk.borrow_mut() = None;
+        }
+    }
+
+    /// Writes what was typed to the file. Untouched files are never
+    /// written; if the file changed on disk meanwhile, the typed text goes
+    /// to a copy beside it instead of over the other edit.
+    fn save_editor(self: &Rc<Self>) {
+        let Some(path) = self.editor_path.borrow().clone() else { return };
+        if !self.editor_dirty.get() {
             return;
         }
-        let tmp = path.with_extension("md.tmp");
-        if std::fs::write(&tmp, &text).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let buffer = self.editor.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+        let disk = std::fs::read_to_string(&path).ok();
+        let loaded = self.editor_disk.borrow().clone();
+        if disk.as_deref() == Some(text.as_str()) {
+            self.editor_dirty.set(false);
+            *self.editor_disk.borrow_mut() = disk;
+            return;
+        }
+        if disk.is_some() && disk != loaded {
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+            let copy = path.with_file_name(format!("{stem} (my edits {}){ext}", store::now()));
+            match std::fs::write(&copy, &text) {
+                Ok(()) => {
+                    self.flash(&format!(
+                        "{} changed on disk while you typed; your version is in {}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        copy.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    if self.current_key.borrow().as_deref() == Some(&format!("note:{}", path.display())) {
+                        self.load_editor(&path);
+                    } else {
+                        self.editor_dirty.set(false);
+                        *self.editor_disk.borrow_mut() = disk;
+                    }
+                }
+                Err(e) => self.flash(&format!("could not save your edits: {e}")),
+            }
+            return;
+        }
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        match std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &path)) {
+            Ok(()) => {
+                self.editor_dirty.set(false);
+                *self.editor_disk.borrow_mut() = Some(text);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                self.flash(&format!("not saved: {e}"));
+            }
         }
     }
 
@@ -3359,8 +3728,8 @@ impl App {
     /// Starts a run of the workflow as a new task. Earlier runs of the same
     /// workflow are archived so only the latest shows.
     fn run_workflow(self: &Rc<Self>, pid: &str, wf: &Workflow, focus: bool) {
-        if agents::get(&wf.agent).is_none() {
-            self.flash(&format!("{}: unknown agent \"{}\"", wf.name, wf.agent));
+        if !agents::takes_opening_prompt(&wf.agent) {
+            self.flash(&format!("{}: agent \"{}\" cannot take a workflow prompt", wf.name, wf.agent));
             return;
         }
         let now = store::now();
@@ -3513,8 +3882,7 @@ impl App {
 
         let in_editor = self.current_key.borrow().as_deref().is_some_and(|k| k.starts_with("note:"));
         if in_editor && key == gdk::Key::Escape && !ctrl && !alt && !shift {
-            self.save_editor();
-            *self.editor_path.borrow_mut() = None;
+            self.close_editor();
             // Back to the list it was opened from.
             match self.view.get() {
                 v @ (View::Notes | View::Workflows) => self.show_view(v),
@@ -3523,8 +3891,8 @@ impl App {
             return glib::Propagation::Stop;
         }
         if in_editor && ctrl && !shift && !alt && key == gdk::Key::o {
-            self.save_editor();
-            let path = self.editor_path.borrow_mut().take();
+            let path = self.editor_path.borrow().clone();
+            self.close_editor();
             let project = self.current_project.borrow().clone().and_then(|pid| self.state.borrow().project(&pid).cloned());
             if let (Some(path), Some(p)) = (path, project) {
                 self.edit_in_terminal(&p, &path);
@@ -3533,7 +3901,9 @@ impl App {
         }
         if in_editor && ctrl && !shift && !alt && key == gdk::Key::s {
             self.save_editor();
-            self.flash("saved");
+            if !self.editor_dirty.get() {
+                self.flash("saved");
+            }
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::F1 && !ctrl && !alt {
@@ -3620,6 +3990,7 @@ impl App {
             match key {
                 gdk::Key::Up => self.move_selection(-1),
                 gdk::Key::Down => self.move_selection(1),
+                gdk::Key::slash => self.open_search(),
                 _ => return glib::Propagation::Proceed,
             }
             return glib::Propagation::Stop;
@@ -3761,6 +4132,38 @@ impl App {
     /// Obsidian vault, carrying the existing brief and handoffs across.
     /// Points the notes at another folder. With `then_open`, opens the brief
     /// in Obsidian afterwards if the folder is in a vault.
+    /// Reports saves that failed, and asks what to do when the saved
+    /// projects could not be read, instead of quietly starting empty.
+    fn watch_state_errors(self: &Rc<Self>) {
+        let b = self.clone();
+        glib::timeout_add_seconds_local(2, move || {
+            if let Some(e) = store::take_save_error() {
+                b.flash(&format!("not saved: {e}"));
+            }
+            glib::ControlFlow::Continue
+        });
+        let Some(err) = self.state.borrow().load_error.clone() else { return };
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message("Codebench could not read its saved projects")
+            .detail(format!(
+                "{err}\n\nStart fresh to use Codebench with no projects (the old file is kept), or quit and fix the file."
+            ))
+            .buttons(["Quit", "Start fresh"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let b = self.clone();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            if res == Ok(1) {
+                b.state.borrow_mut().start_fresh();
+                b.state.borrow().save();
+            } else {
+                b.window.application().inspect(|a| a.quit());
+            }
+        });
+    }
+
     fn link_notes_dialog(self: &Rc<Self>, then_open: bool) {
         let Some(pid) = self.current_project.borrow().clone() else {
             self.flash("select a project first");
@@ -3773,15 +4176,30 @@ impl App {
         let b = self.clone();
         dialog.select_folder(Some(&self.window), None::<&gio::Cancellable>, move |res| {
             let Some(dir) = res.ok().and_then(|f| f.path()) else { return };
-            let old = {
+            // Copies everything over first; the project points at the new
+            // folder only once that worked.
+            let result = {
                 let mut state = b.state.borrow_mut();
-                let Some(p) = state.project_mut(&pid) else { return };
-                let old = p.notes_dir();
-                p.notes = Some(dir.clone());
-                state.save();
-                old
+                let Some(mut p) = state.project(&pid).cloned() else { return };
+                notes::relink(&mut p, &dir).and_then(|left| {
+                    let before = state.project(&pid).cloned();
+                    if let Some(slot) = state.project_mut(&pid) {
+                        *slot = p;
+                    }
+                    state.try_save().map(|_| left).inspect_err(|_| {
+                        if let (Some(slot), Some(before)) = (state.project_mut(&pid), before) {
+                            *slot = before;
+                        }
+                    })
+                })
             };
-            notes::carry_over(&old, &dir);
+            let left = match result {
+                Ok(left) => left,
+                Err(e) => {
+                    b.flash(&format!("notes not moved: {e}"));
+                    return;
+                }
+            };
             // The editor pane still has the old folder open.
             let key = notes_key(&pid);
             b.stop(&key);
@@ -3789,7 +4207,12 @@ impl App {
             b.update_header();
             let in_vault = notes::vault_root(&dir).is_some();
             let where_ = if in_vault { "in your vault" } else { "" };
-            b.flash(&format!("notes now live {where_} at {}", tilde(&dir)));
+            let kept = match left.as_slice() {
+                [] => String::new(),
+                [one] => format!(" · {} not copied (the new folder has its own)", one.display()),
+                many => format!(" · {} files not copied (the new folder has its own), e.g. {}", many.len(), many[0].display()),
+            };
+            b.flash(&format!("notes now live {where_} at {}{kept}", tilde(&dir)));
             if then_open && in_vault {
                 open_obsidian(&dir);
             } else if then_open {
@@ -3813,37 +4236,56 @@ impl App {
     }
 
     fn stop_current(self: &Rc<Self>) {
-        let Some(key) = self.current_key.borrow().clone() else { return };
+        let Some(key) = self.focused_key() else { return };
         self.stop(&key);
         self.flash("stopped. select it again to resume");
     }
 
-    /// First press arms, a second press within three seconds deletes.
+    /// Asks before deleting the selected task, or removing the selected
+    /// project, in a dialog that defaults to Cancel.
     fn delete_current(self: &Rc<Self>) {
         let Some(target) = self.selected_row() else { return };
-        let key = match &target {
-            Row::Project(id) | Row::Session(id) => id.clone(),
-            Row::Notes(_) | Row::NewTask(_) => return,
+        let (message, detail, button) = {
+            let state = self.state.borrow();
+            match &target {
+                Row::Project(pid) => {
+                    let Some(p) = state.project(pid) else { return };
+                    (
+                        format!("Remove project “{}”?", p.name),
+                        "It leaves codebench and its tasks stop. The folder and its notes stay on disk.".to_string(),
+                        "Remove",
+                    )
+                }
+                Row::Session(sid) => {
+                    let Some((_, s)) = state.session(sid) else { return };
+                    let detail = if s.worktree.is_some() {
+                        "The task stops and its worktree is deleted. Anything not merged is lost."
+                    } else {
+                        "The task stops and its conversation leaves codebench."
+                    };
+                    (format!("Delete task “{}”?", s.title), detail.to_string(), "Delete")
+                }
+                Row::Notes(_) | Row::NewTask(_) => return,
+            }
         };
-        let armed = self
-            .pending_delete
-            .borrow()
-            .as_ref()
-            .is_some_and(|(id, at)| *id == key && at.elapsed() < Duration::from_secs(3));
-        if !armed {
-            *self.pending_delete.borrow_mut() = Some((key, Instant::now()));
-            let has_worktree = matches!(&target, Row::Session(sid)
-                if self.state.borrow().session(sid).is_some_and(|(_, s)| s.worktree.is_some()));
-            self.flash(match &target {
-                Row::Project(_) => "press ^⇧D again to remove this project from codebench (files and notes are kept)",
-                _ if has_worktree => "press ^⇧D again to delete this task and its worktree. anything not merged is lost",
-                _ => "press ^⇧D again to delete this task",
-            });
-            return;
-        }
-        *self.pending_delete.borrow_mut() = None;
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(message)
+            .detail(detail)
+            .buttons(["Cancel", button])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let b = self.clone();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            if res == Ok(1) {
+                b.delete_row(&target);
+            }
+        });
+    }
 
-        let doomed: Vec<String> = match &target {
+    fn delete_row(self: &Rc<Self>, target: &Row) {
+        let doomed: Vec<String> = match target {
             Row::Session(sid) => vec![sid.clone()],
             Row::Project(pid) => self
                 .state
@@ -3860,10 +4302,13 @@ impl App {
                 self.detach(key, &r.term);
             }
             self.status.borrow_mut().remove(key);
+            if let Some(r) = self.remote.borrow().as_ref() {
+                r.forget_task(key);
+            }
         }
 
         let mut state = self.state.borrow_mut();
-        let next = match &target {
+        let next = match target {
             Row::Session(sid) => {
                 let pid = state.session(sid).map(|(p, _)| p.id.clone());
                 if let Some(p) = pid.as_deref().and_then(|id| state.project_mut(id)) {
@@ -3904,17 +4349,25 @@ impl App {
             self.flash("select a project first, or ^⇧O to add one");
             return;
         };
-        let is_repo = self.state.borrow().project(&pid).is_some_and(|p| git::is_repo(&p.path));
+        let (is_repo, has_commit) = self
+            .state
+            .borrow()
+            .project(&pid)
+            .map_or((false, false), |p| (git::is_repo(&p.path), git::has_commit(&p.path)));
         let agents = agents::installed();
         self.picker.fill(
             "",
             Some(("task name (optional)", "")),
             &agents.iter().map(|a| format!("{:<9}{}", a.id, a.label)).collect::<Vec<_>>(),
         );
-        self.picker.isolate.set(is_repo.then_some(false));
+        self.picker.isolate.set((is_repo && has_commit).then_some(false));
         *self.picker.items.borrow_mut() = agents.iter().map(|a| a.id).collect();
         *self.picker.mode.borrow_mut() = PickerMode::NewTask;
         self.new_task_title();
+        if is_repo && !has_commit {
+            let title = self.picker.title.text();
+            self.picker.title.set_text(&format!("{title}   (own worktree needs a first commit)"));
+        }
         self.picker.show();
     }
 
@@ -3991,6 +4444,7 @@ impl App {
             Action::Sidebar => self.sidebar_box.set_visible(!self.sidebar_box.is_visible()),
             Action::Files => self.open_files(),
             Action::TopBars => self.toggle_top_bars(),
+            Action::Search => self.open_search(),
         }
     }
 
@@ -4168,9 +4622,26 @@ impl Picker {
         let entry = gtk::Entry::new();
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
+        // Long lists scroll inside the picker, keeping the pick in view.
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_max_content_height(440);
+        scroll.set_child(Some(&list));
+        list.connect_row_selected(|list, row| {
+            let (Some(row), Some(scroll)) = (row, list.parent().and_then(|v| v.parent()).and_downcast::<gtk::ScrolledWindow>()) else { return };
+            let Some(r) = row.compute_bounds(list) else { return };
+            let adj = scroll.vadjustment();
+            let (y, h) = (r.y() as f64, r.height() as f64);
+            if y < adj.value() {
+                adj.set_value(y);
+            } else if y + h > adj.value() + adj.page_size() {
+                adj.set_value(y + h - adj.page_size());
+            }
+        });
         root.append(&title);
         root.append(&entry);
-        root.append(&list);
+        root.append(&scroll);
         Picker {
             root,
             title,
@@ -4205,9 +4676,15 @@ impl Picker {
         for option in options {
             let l = label("cb-option");
             l.set_text(option);
+            l.set_wrap(true);
+            l.set_wrap_mode(pango::WrapMode::WordChar);
+            l.set_max_width_chars(60);
             self.list.append(&l);
         }
         self.list.set_visible(!options.is_empty());
+        if let Some(scroll) = self.list.parent().and_then(|v| v.parent()) {
+            scroll.set_visible(!options.is_empty());
+        }
         if let Some(first) = self.list.row_at_index(0) {
             self.list.select_row(Some(&first));
         }

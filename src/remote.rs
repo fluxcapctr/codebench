@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -69,18 +69,51 @@ pub struct Device {
 struct Shared {
     state_json: String,
     theme_css: String,
+    /// Latest screen of each watched task, plus one-off captures.
     screens: HashMap<String, String>,
-    watched: HashSet<String>,
+    /// How many live sockets watch each task.
+    watched: HashMap<String, usize>,
     pairings: HashMap<String, Pairing>,
     devices: Vec<Device>,
     /// Where phones reach artifacts (tailnet https base) and their key.
     artifacts: Option<(String, String)>,
 }
 
+/// What live sockets are told. Screens go only to sockets watching that
+/// task; `Revoked` closes that device's sockets.
+#[derive(Clone)]
+enum Event {
+    Text(String),
+    Screen { task: String, json: String },
+    Revoked(String),
+}
+
+impl Shared {
+    fn paired(&self, device: &str) -> bool {
+        self.devices.iter().any(|d| d.token_sha256 == device)
+    }
+
+    fn watch(&mut self, task: &str) {
+        *self.watched.entry(task.to_string()).or_default() += 1;
+    }
+
+    /// Stops one socket's watch; a task nobody watches keeps no screen.
+    fn unwatch(&mut self, task: &str) {
+        if let Some(n) = self.watched.get_mut(task) {
+            *n -= 1;
+            if *n == 0 {
+                self.watched.remove(task);
+                let watched = &self.watched;
+                self.screens.retain(|k, _| watched.contains_key(k));
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Ctx {
     shared: Arc<Mutex<Shared>>,
-    events: broadcast::Sender<String>,
+    events: broadcast::Sender<Event>,
     commands: async_channel::Sender<Command>,
     /// The only Tailscale login allowed, when requests come via tailscale.
     owner: Option<String>,
@@ -89,7 +122,7 @@ struct Ctx {
 /// The GTK side's handle on the running server.
 pub struct Remote {
     shared: Arc<Mutex<Shared>>,
-    events: broadcast::Sender<String>,
+    events: broadcast::Sender<Event>,
     pub commands: async_channel::Receiver<Command>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     runtime: tokio::runtime::Handle,
@@ -186,16 +219,22 @@ impl Remote {
         }
         s.state_json = json.clone();
         drop(s);
-        let _ = self.events.send(format!(r#"{{"type":"state","data":{json}}}"#));
+        let _ = self.events.send(Event::Text(format!(r#"{{"type":"state","data":{json}}}"#)));
     }
 
     pub fn publish_theme(&self, css: String) {
         self.shared.lock().unwrap().theme_css = css;
-        let _ = self.events.send(r#"{"type":"theme"}"#.to_string());
+        let _ = self.events.send(Event::Text(r#"{"type":"theme"}"#.to_string()));
     }
 
+    /// Whether a phone is looking at this task right now.
     pub fn is_watched(&self, key: &str) -> bool {
-        self.shared.lock().unwrap().watched.contains(key)
+        self.shared.lock().unwrap().watched.contains_key(key)
+    }
+
+    /// Drops what is kept for a task that no longer exists.
+    pub fn forget_task(&self, key: &str) {
+        self.shared.lock().unwrap().screens.remove(key);
     }
 
     pub fn publish_screen(&self, key: &str, html: String) {
@@ -205,8 +244,8 @@ impl Remote {
         }
         s.screens.insert(key.to_string(), html.clone());
         drop(s);
-        let msg = serde_json::json!({ "type": "screen", "task": key, "html": html });
-        let _ = self.events.send(msg.to_string());
+        let json = serde_json::json!({ "type": "screen", "task": key, "html": html }).to_string();
+        let _ = self.events.send(Event::Screen { task: key.to_string(), json });
     }
 
     pub fn decide_pairing(&self, id: &str, approve: bool) {
@@ -263,7 +302,7 @@ impl Remote {
         let mut s = self.shared.lock().unwrap();
         s.devices.retain(|d| d.token_sha256 != token_sha256);
         save_devices(&s.devices);
-        let _ = self.events.send(r#"{"type":"revoked"}"#.to_string());
+        let _ = self.events.send(Event::Revoked(token_sha256.to_string()));
     }
 }
 
@@ -345,15 +384,16 @@ fn device_of(ctx: &Ctx, headers: &HeaderMap) -> Option<String> {
     ctx.shared.lock().unwrap().devices.iter().any(|d| d.token_sha256 == hash).then_some(hash)
 }
 
-fn token_ok(ctx: &Ctx, token: &str) -> bool {
+/// The device a token belongs to, by token hash, noting it was seen.
+fn token_device(ctx: &Ctx, token: &str) -> Option<String> {
     if token.len() < 32 {
-        return false;
+        return None;
     }
     let hash = sha256_hex(token);
     let mut s = ctx.shared.lock().unwrap();
-    let Some(d) = s.devices.iter_mut().find(|d| d.token_sha256 == hash) else { return false };
+    let d = s.devices.iter_mut().find(|d| d.token_sha256 == hash)?;
     d.last_seen = now();
-    true
+    Some(hash)
 }
 
 fn authorized(ctx: &Ctx, headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -365,7 +405,7 @@ fn authorized(ctx: &Ctx, headers: &HeaderMap) -> Result<(), StatusCode> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if token_ok(ctx, token) { Ok(()) } else { Err(StatusCode::UNAUTHORIZED) }
+    token_device(ctx, token).map(|_| ()).ok_or(StatusCode::UNAUTHORIZED)
 }
 
 #[derive(Deserialize)]
@@ -428,11 +468,7 @@ async fn screen(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<Strin
     if let Err(code) = authorized(&ctx, &headers) {
         return code.into_response();
     }
-    let html = {
-        let mut s = ctx.shared.lock().unwrap();
-        s.watched.insert(id.clone());
-        s.screens.get(&id).cloned().unwrap_or_default()
-    };
+    let html = ctx.shared.lock().unwrap().screens.get(&id).cloned().unwrap_or_default();
     Json(serde_json::json!({ "html": html })).into_response()
 }
 
@@ -472,7 +508,6 @@ async fn open(State(ctx): State<Ctx>, headers: HeaderMap, Path(id): Path<String>
     if let Err(code) = authorized(&ctx, &headers) {
         return code.into_response();
     }
-    ctx.shared.lock().unwrap().watched.insert(id.clone());
     let _ = ctx.commands.send(Command::Open { task: id }).await;
     StatusCode::NO_CONTENT.into_response()
 }
@@ -642,7 +677,7 @@ async fn run_workflow(State(ctx): State<Ctx>, headers: HeaderMap, Path(project):
 
 /// Live updates. The first message must be `{"auth": "<token>"}`, since a
 /// browser cannot set headers on a WebSocket; `{"watch": "<task>"}` asks for
-/// that task's screen.
+/// that task's screen until another watch or `{"watch": null}`.
 async fn live(State(ctx): State<Ctx>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     if !tailnet_ok(&ctx, &headers) {
         return StatusCode::FORBIDDEN.into_response();
@@ -650,59 +685,95 @@ async fn live(State(ctx): State<Ctx>, headers: HeaderMap, ws: WebSocketUpgrade) 
     ws.on_upgrade(move |socket| live_socket(ctx, socket))
 }
 
+/// One socket's watched task, given back however the socket ends.
+struct Watching {
+    shared: Arc<Mutex<Shared>>,
+    task: Option<String>,
+}
+
+impl Watching {
+    /// Watches `task` instead of the last one; the screen kept for it, if any.
+    fn set(&mut self, task: Option<&str>) -> Option<String> {
+        if self.task.as_deref() == task {
+            return None;
+        }
+        let mut s = self.shared.lock().unwrap();
+        if let Some(old) = self.task.take() {
+            s.unwatch(&old);
+        }
+        let task = task?;
+        s.watch(task);
+        self.task = Some(task.to_string());
+        s.screens.get(task).cloned()
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.shared.lock().unwrap().unwatch(&task);
+        }
+    }
+}
+
 async fn live_socket(ctx: Ctx, mut socket: WebSocket) {
-    let authed = match tokio::time::timeout(std::time::Duration::from_secs(10), socket.recv()).await {
+    let device = match tokio::time::timeout(std::time::Duration::from_secs(10), socket.recv()).await {
         Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<serde_json::Value>(&t)
             .ok()
-            .and_then(|v| v["auth"].as_str().map(|s| token_ok(&ctx, s)))
-            .unwrap_or(false),
-        _ => false,
+            .and_then(|v| v["auth"].as_str().and_then(|s| token_device(&ctx, s))),
+        _ => None,
     };
-    if !authed {
+    let Some(device) = device else {
         let _ = socket.send(Message::Text(r#"{"type":"unauthorized"}"#.into())).await;
         return;
-    }
+    };
+    let mut events = ctx.events.subscribe();
     let initial = ctx.shared.lock().unwrap().state_json.clone();
     if !initial.is_empty() {
         let _ = socket.send(Message::Text(format!(r#"{{"type":"state","data":{initial}}}"#).into())).await;
     }
-    let mut events = ctx.events.subscribe();
-    let mut watching: Option<String> = None;
+    let mut watching = Watching { shared: ctx.shared.clone(), task: None };
     loop {
-        tokio::select! {
+        let out = tokio::select! {
             incoming = socket.recv() => {
                 let Some(Ok(msg)) = incoming else { break };
-                if let Message::Text(t) = msg
-                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
-                    && let Some(task) = v["watch"].as_str()
-                {
-                    watching = Some(task.to_string());
-                    let html = {
-                        let mut s = ctx.shared.lock().unwrap();
-                        s.watched.insert(task.to_string());
-                        s.screens.get(task).cloned()
-                    };
-                    if let Some(html) = html {
-                        let msg = serde_json::json!({ "type": "screen", "task": task, "html": html });
-                        let _ = socket.send(Message::Text(msg.to_string().into())).await;
-                    }
+                let Message::Text(t) = msg else { continue };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                let Some(watch) = v.get("watch") else { continue };
+                if !ctx.shared.lock().unwrap().paired(&device) {
+                    let _ = socket.send(Message::Text(r#"{"type":"revoked"}"#.into())).await;
+                    break;
+                }
+                let task = watch.as_str();
+                match watching.set(task).zip(task) {
+                    Some((html, task)) => serde_json::json!({ "type": "screen", "task": task, "html": html }).to_string(),
+                    None => continue,
                 }
             }
             event = events.recv() => {
-                let Ok(event) = event else { continue };
-                // Screens go only to the phone looking at that task.
-                if event.starts_with(r#"{"html""#) || event.contains(r#""type":"screen""#) {
-                    let for_me = watching.as_deref().is_some_and(|w| event.contains(&format!(r#""task":"{w}""#)));
-                    if !for_me {
-                        continue;
-                    }
-                }
-                if socket.send(Message::Text(event.into())).await.is_err() {
+                let event = match event {
+                    Ok(e) => e,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                // A revoked phone hears nothing more, even if it missed
+                // or ignores the notice.
+                if matches!(&event, Event::Revoked(d) if *d == device) || !ctx.shared.lock().unwrap().paired(&device) {
+                    let _ = socket.send(Message::Text(r#"{"type":"revoked"}"#.into())).await;
                     break;
                 }
+                match event {
+                    Event::Text(json) => json,
+                    Event::Screen { task, json } if watching.task.as_deref() == Some(task.as_str()) => json,
+                    Event::Screen { .. } | Event::Revoked(_) => continue,
+                }
             }
+        };
+        if socket.send(Message::Text(out.into())).await.is_err() {
+            break;
         }
     }
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 #[cfg(test)]
@@ -715,5 +786,23 @@ mod tests {
         assert_eq!(random_code().len(), 6);
         assert_ne!(random_hex(16), random_hex(16));
         assert_eq!(sha256_hex("abc").len(), 64);
+    }
+
+    #[test]
+    fn watches_end_with_their_socket() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        shared.lock().unwrap().screens.insert("b".into(), "old".into());
+        let mut one = Watching { shared: shared.clone(), task: None };
+        let mut two = Watching { shared: shared.clone(), task: None };
+        assert_eq!(one.set(Some("a")), None);
+        assert_eq!(two.set(Some("b")), Some("old".into()));
+        one.set(Some("b"));
+        assert!(!shared.lock().unwrap().watched.contains_key("a"));
+        assert_eq!(shared.lock().unwrap().watched["b"], 2);
+        drop(one);
+        assert_eq!(shared.lock().unwrap().watched["b"], 1);
+        two.set(None);
+        let s = shared.lock().unwrap();
+        assert!(s.watched.is_empty() && s.screens.is_empty());
     }
 }

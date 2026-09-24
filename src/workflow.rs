@@ -247,21 +247,58 @@ pub fn save_runs(runs: &HashMap<String, u64>) {
     }
 }
 
-/// Local midnight `days_back` days before `now`, and that day's weekday.
-fn local_day(now: u64, days_back: i64) -> Option<(u64, u32)> {
+/// Moves schedule records for workflows under `from` to the same files
+/// under `to`, for when a project's notes folder moves.
+pub fn rebase_runs(from: &Path, to: &Path) {
+    let mut runs = load_runs();
+    if rebase_keys(&mut runs, from, to) {
+        save_runs(&runs);
+    }
+}
+
+fn rebase_keys(runs: &mut HashMap<String, u64>, from: &Path, to: &Path) -> bool {
+    let moved: Vec<(String, String)> = runs
+        .keys()
+        .filter_map(|k| Some((k.clone(), to.join(Path::new(k).strip_prefix(from).ok()?).to_string_lossy().into_owned())))
+        .collect();
+    for (old, new) in &moved {
+        let last = runs.remove(old).unwrap_or(0);
+        runs.entry(new.clone()).or_insert(last);
+    }
+    !moved.is_empty()
+}
+
+/// `minute` past local midnight, `days_back` days before `now`, by the wall
+/// clock, and that day's weekday. A time the clock skips (spring forward)
+/// counts from before the jump, so 02:30 becomes 03:30; a time it repeats
+/// (fall back) is its first occurrence.
+fn local_time(now: u64, days_back: i64, minute: u32) -> Option<(u64, u32)> {
     unsafe {
         let t = now as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
+        let mut day: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut day).is_null() {
             return None;
         }
-        tm.tm_mday -= days_back as i32;
-        tm.tm_hour = 0;
-        tm.tm_min = 0;
-        tm.tm_sec = 0;
-        tm.tm_isdst = -1;
-        let midnight = libc::mktime(&mut tm);
-        (midnight >= 0).then_some((midnight as u64, tm.tm_wday as u32))
+        day.tm_mday -= days_back as i32;
+        day.tm_hour = (minute / 60) as i32;
+        day.tm_min = (minute % 60) as i32;
+        day.tm_sec = 0;
+        let mut exact = None;
+        let mut any = None;
+        for isdst in [0, 1] {
+            let mut tm = day;
+            tm.tm_isdst = isdst;
+            let at = libc::mktime(&mut tm);
+            if at == -1 {
+                continue;
+            }
+            let found = (at as u64, tm.tm_wday as u32);
+            if tm.tm_isdst == isdst && tm.tm_hour == day.tm_hour && tm.tm_min == day.tm_min {
+                exact = Some(exact.map_or(found, |e: (u64, u32)| e.min(found)));
+            }
+            any = any.max(Some(found));
+        }
+        exact.or(any)
     }
 }
 
@@ -269,8 +306,7 @@ fn local_day(now: u64, days_back: i64) -> Option<(u64, u32)> {
 pub fn latest_slot(schedule: &Schedule, now: u64) -> Option<u64> {
     let Schedule::At { days, minute } = schedule else { return None };
     (0..8).find_map(|back| {
-        let (midnight, weekday) = local_day(now, back)?;
-        let slot = midnight + *minute as u64 * 60;
+        let (slot, weekday) = local_time(now, back, *minute)?;
         (days & (1 << weekday) != 0 && slot <= now).then_some(slot)
     })
 }
@@ -442,6 +478,67 @@ mod tests {
         assert!(!is_due(&daily, slot, now));
         assert!(is_due(&Schedule::Every(3600), now - 3600, now));
         assert!(!is_due(&Schedule::Every(3600), now - 60, now));
+    }
+
+    #[test]
+    fn run_records_follow_moved_notes() {
+        let mut runs = HashMap::from([
+            ("/old/workflows/check.md".to_string(), 5),
+            ("/old/workflows/g.md#p".to_string(), 6),
+            ("/elsewhere/x.md".to_string(), 7),
+        ]);
+        assert!(rebase_keys(&mut runs, Path::new("/old/workflows"), Path::new("/new/workflows")));
+        assert_eq!(runs.get("/new/workflows/check.md"), Some(&5));
+        assert_eq!(runs.get("/new/workflows/g.md#p"), Some(&6));
+        assert_eq!(runs.get("/elsewhere/x.md"), Some(&7));
+        assert_eq!(runs.len(), 3);
+        assert!(!rebase_keys(&mut runs, Path::new("/old/workflows"), Path::new("/new/workflows")));
+    }
+
+    /// Runs `dst_wall_clock_inner` in a child with the zone set, since TZ is
+    /// process-wide.
+    #[test]
+    fn daily_slots_keep_wall_clock_across_dst() {
+        if !Path::new("/usr/share/zoneinfo/America/Los_Angeles").exists() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "workflow::tests::dst_wall_clock_inner", "--ignored", "--test-threads=1"])
+            .env("TZ", "America/Los_Angeles")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    #[ignore = "run by daily_slots_keep_wall_clock_across_dst"]
+    fn dst_wall_clock_inner() {
+        assert_eq!(std::env::var("TZ").as_deref(), Ok("America/Los_Angeles"));
+        let local = |mon: i32, mday: i32, hour: i32, min: i32| unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_isdst) = (126, mon - 1, mday, hour, min, -1);
+            libc::mktime(&mut tm) as u64
+        };
+        let wall = |slot: u64| unsafe {
+            let t = slot as libc::time_t;
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&t, &mut tm);
+            (tm.tm_mday, tm.tm_hour, tm.tm_min)
+        };
+        let nine = parse_schedule("daily 09:00").unwrap();
+        // Spring forward is March 8 2026, fall back November 1, both at 02:00.
+        for (mon, day) in [(3, 7), (3, 8), (3, 9), (10, 31), (11, 1), (11, 2)] {
+            assert_eq!(wall(latest_slot(&nine, local(mon, day, 12, 0)).unwrap()), (day, 9, 0), "{mon}/{day}");
+            assert_ne!(wall(latest_slot(&nine, local(mon, day, 8, 59)).unwrap()).0, day);
+        }
+        // 02:30 does not exist on March 8: it runs at 03:30.
+        assert_eq!(wall(latest_slot(&parse_schedule("daily 02:30").unwrap(), local(3, 8, 12, 0)).unwrap()), (8, 3, 30));
+        // 01:30 happens twice on November 1: the first one counts, once.
+        let slot = latest_slot(&parse_schedule("daily 01:30").unwrap(), local(11, 1, 12, 0)).unwrap();
+        assert_eq!(wall(slot), (1, 1, 30));
+        assert_eq!(wall(slot + 3600), (1, 1, 30), "the first of the two");
+        assert!(!is_due(&parse_schedule("daily 01:30").unwrap(), slot, slot + 3600));
     }
 
     #[test]
