@@ -131,7 +131,7 @@ const ACTIONS: &[(&str, &str, Action)] = &[
     ("Ctrl+Shift+Y", "phone access: on or off, address, paired phones", Action::Phone),
     ("Ctrl+Shift+L", "link notes to a folder, e.g. in your Obsidian vault", Action::LinkNotes),
     ("Ctrl+Shift+J", "open the brief in Obsidian", Action::Obsidian),
-    ("Ctrl+Shift+R", "rename the task or project", Action::Rename),
+    ("Ctrl+Shift+R", "rename the open task, or the project if none (right-click a tab to rename it)", Action::Rename),
     ("Ctrl+Shift+G", "git (lazygit) for this task or project", Action::Git),
     ("Ctrl+Shift+F", "browse files (yazi, or your editor) in this task's folder", Action::Files),
     ("Ctrl+Shift+M", "merge a worktree task back into its branch (press twice)", Action::Merge),
@@ -638,26 +638,38 @@ fn agent_icon(agent: &str, theme: &Theme) -> Option<gdk::Texture> {
 }
 
 /// A task row: status glyph, the agent's logo (or name), then the rest.
-fn task_row(glyph: &str, agent: &str, rest: &str, theme: &Theme) -> gtk::ListBoxRow {
-    let Some(icon) = agent_icon(agent, theme) else {
-        return row_with(&format!("{glyph} <span foreground='{}'>{:<8}</span>{rest}", theme.muted, esc(agent)));
-    };
+fn task_row(glyph: &str, status: Status, agent: &str, rest: &str, theme: &Theme) -> gtk::ListBoxRow {
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     let g = gtk::Label::new(None);
     g.set_markup(glyph);
-    let image = gtk::Image::from_paintable(Some(&icon));
-    image.set_pixel_size(14);
-    image.set_tooltip_text(agents::get(agent).map(|a| a.label));
+    if status == Status::Working {
+        g.add_css_class("cb-pulse");
+    }
+    line.append(&g);
+    let rest = match agent_icon(agent, theme) {
+        Some(icon) => {
+            let image = gtk::Image::from_paintable(Some(&icon));
+            image.set_pixel_size(14);
+            image.set_tooltip_text(agents::get(agent).map(|a| a.label));
+            line.append(&image);
+            rest.to_string()
+        }
+        None => format!("<span foreground='{}'>{:<8}</span>{rest}", theme.muted, esc(agent)),
+    };
     let l = gtk::Label::new(None);
     l.set_xalign(0.0);
     l.set_hexpand(true);
     l.set_ellipsize(pango::EllipsizeMode::End);
-    l.set_markup(rest);
-    line.append(&g);
-    line.append(&image);
+    l.set_markup(&rest);
     line.append(&l);
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&line));
+    // Finished or asking, and not looked at yet: mark the whole row.
+    match status {
+        Status::Done => row.add_css_class("cb-done"),
+        Status::Waiting => row.add_css_class("cb-needs"),
+        _ => {}
+    }
     row
 }
 
@@ -1422,8 +1434,14 @@ impl App {
                 });
             }
             if let Some(me) = me.clone() {
+                let (m, pid) = (me.clone(), p.id.clone());
+                tab.connect_clicked(move |_| m.switch_project(&pid));
+                // Right-click renames the project, whatever task is open.
+                let right = gtk::GestureClick::new();
+                right.set_button(3);
                 let pid = p.id.clone();
-                tab.connect_clicked(move |_| me.switch_project(&pid));
+                right.connect_pressed(move |_, _, _, _| me.open_rename_project(&pid));
+                tab.add_controller(right);
             }
             self.tabs_box.append(&tab);
         }
@@ -1477,9 +1495,12 @@ impl App {
                 words.iter().all(|w| hay.contains(w))
             };
             for s in p.sessions.iter().filter(shown) {
-                let (glyph, color, word) = self.status_of(&s.id).look(&theme);
+                let status = self.status_of(&s.id);
+                let (glyph, color, word) = status.look(&theme);
                 let word = if word.is_empty() {
                     String::new()
+                } else if status.wants_attention() {
+                    format!("  <span foreground='{color}'><b>{word}</b></span>")
                 } else {
                     format!("  <span foreground='{color}'>{word}</span>")
                 };
@@ -1517,6 +1538,7 @@ impl App {
                 };
                 self.sidebar.append(&task_row(
                     &format!("<span foreground='{color}'>{glyph}</span>"),
+                    status,
                     &s.agent,
                     &format!("{title}{tokens}{word}"),
                     &theme,
@@ -4390,14 +4412,16 @@ impl App {
                 *self.picker.mode.borrow_mut() = PickerMode::Rename(sid);
                 self.picker.show();
             }
-            Some(Row::Project(pid)) => {
-                let name = self.state.borrow().project(&pid).map(|p| p.name.clone()).unwrap_or_default();
-                self.picker.fill("rename project (the folder is not renamed)", Some(("project name", &name)), &[]);
-                *self.picker.mode.borrow_mut() = PickerMode::RenameProject(pid);
-                self.picker.show();
-            }
+            Some(Row::Project(pid)) => self.open_rename_project(&pid),
             _ => self.flash("select a task or a project to rename it"),
         }
+    }
+
+    fn open_rename_project(self: &Rc<Self>, pid: &str) {
+        let name = self.state.borrow().project(pid).map(|p| p.name.clone()).unwrap_or_default();
+        self.picker.fill("rename project (the folder is not renamed)", Some(("project name", &name)), &[]);
+        *self.picker.mode.borrow_mut() = PickerMode::RenameProject(pid.to_string());
+        self.picker.show();
     }
 
     fn open_help(self: &Rc<Self>) {

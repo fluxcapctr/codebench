@@ -148,6 +148,8 @@ impl Theme {
             light_background: light,
             font_family: font,
             font_size: size,
+            green,
+            red,
             ..
         } = self;
         format!(
@@ -186,6 +188,10 @@ paned > separator:focus, paned > separator:hover {{ background: {muted}; box-sha
 .cb-page {{ padding: 0 16px 16px; background: transparent; }}
 .cb-page > row {{ padding: 6px 8px; }}
 .cb-new {{ margin-top: 6px; }}
+@keyframes cb-pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.25; }} 100% {{ opacity: 1; }} }}
+.cb-pulse {{ animation: cb-pulse 1.4s ease-in-out infinite; }}
+list > row.cb-done {{ background: alpha({green}, 0.14); border-left: 3px solid {green}; padding-left: 9px; }}
+list > row.cb-needs {{ background: alpha({red}, 0.14); border-left: 3px solid {red}; padding-left: 9px; }}
 textview.cb-editor, textview.cb-editor text {{ background: {bg}; color: {fg}; caret-color: {accent}; }}
 textview.cb-editor text selection {{ background: {selection}; }}
 .cb-picker {{ background: {dark}; border: 1px solid {accent}; padding: 10px; }}
