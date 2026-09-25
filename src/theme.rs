@@ -194,6 +194,10 @@ list > row.cb-done {{ background: alpha({green}, 0.14); border-left: 3px solid {
 list > row.cb-needs {{ background: alpha({red}, 0.14); border-left: 3px solid {red}; padding-left: 9px; }}
 textview.cb-editor, textview.cb-editor text {{ background: {bg}; color: {fg}; caret-color: {accent}; }}
 textview.cb-editor text selection {{ background: {selection}; }}
+popover.cb-menu > contents {{ background: {dark}; border: 1px solid {muted}; padding: 4px 0; }}
+popover.cb-menu button {{ color: {fg}; padding: 3px 14px; min-height: 0; }}
+popover.cb-menu button:hover, popover.cb-menu button:focus {{ background: {selection}; }}
+popover.cb-menu separator {{ background: {muted}; margin: 3px 0; min-height: 1px; }}
 .cb-picker {{ background: {dark}; border: 1px solid {accent}; padding: 10px; }}
 .cb-picker-title {{ color: {accent}; font-weight: bold; margin-bottom: 6px; }}
 .cb-picker entry {{ background: {bg}; color: {fg}; border: 1px solid {muted}; padding: 4px 8px; min-height: 0; caret-color: {accent}; outline: none; }}

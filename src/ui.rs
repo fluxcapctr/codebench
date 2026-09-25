@@ -1064,6 +1064,25 @@ impl App {
             }
         });
 
+        // Right-click a task for its menu, or the empty list for the rest.
+        let b = self.clone();
+        on_right_click(&self.sidebar, move |w, x, y| {
+            let idx = b.sidebar.row_at_y(y as i32).map(|r| r.index());
+            let kind = idx.and_then(|i| b.rows.borrow().get(i as usize).cloned());
+            match kind {
+                Some(Row::Session(sid)) => b.task_menu(&sid, w, x, y),
+                _ => b.sidebar_menu(w, x, y),
+            }
+        });
+        let b = self.clone();
+        on_right_click(&self.page_list, move |w, x, y| {
+            let Some(row) = b.page_list.row_at_y(y as i32) else { return };
+            if row.is_selectable() {
+                b.page_list.select_row(Some(&row));
+            }
+            b.page_menu(row.index() as usize, w, x, y);
+        });
+
         for (view, button) in &self.view_buttons {
             let b = self.clone();
             let view = *view;
@@ -1436,12 +1455,8 @@ impl App {
             if let Some(me) = me.clone() {
                 let (m, pid) = (me.clone(), p.id.clone());
                 tab.connect_clicked(move |_| m.switch_project(&pid));
-                // Right-click renames the project, whatever task is open.
-                let right = gtk::GestureClick::new();
-                right.set_button(3);
                 let pid = p.id.clone();
-                right.connect_pressed(move |_, _, _, _| me.open_rename_project(&pid));
-                tab.add_controller(right);
+                on_right_click(&tab, move |w, x, y| me.project_menu(&pid, w, x, y));
             }
             self.tabs_box.append(&tab);
         }
@@ -1451,7 +1466,11 @@ impl App {
         add.add_css_class("cb-tab");
         add.set_tooltip_text(Some("add a project (Ctrl+Shift+O)"));
         if let Some(me) = me.clone() {
-            add.connect_clicked(move |_| me.open_add_project());
+            let m = me.clone();
+            add.connect_clicked(move |_| m.open_add_project());
+            on_right_click(&add, move |w, x, y| {
+                me.popup(w, x, y, vec![item("add a project…", |b| b.open_add_project())]);
+            });
         }
         self.tabs_box.append(&add);
 
@@ -2365,6 +2384,22 @@ impl App {
         let k = key.to_string();
         focus.connect_enter(move |_| *b.focused.borrow_mut() = Some(k.clone()));
         term.add_controller(focus);
+
+        // Right-click menu. It is caught before the terminal sees it, so a
+        // program's own right-click still works with Shift held.
+        let right = gtk::GestureClick::new();
+        right.set_button(3);
+        right.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let (b, k) = (self.clone(), key.to_string());
+        right.connect_pressed(move |g, _, x, y| {
+            if g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK) {
+                return;
+            }
+            g.set_state(gtk::EventSequenceState::Claimed);
+            let Some(term) = g.widget().and_downcast::<vte::Terminal>() else { return };
+            b.terminal_menu(&k, &term, x, y);
+        });
+        term.add_controller(right);
 
         // Dropping files types their paths in, quoted, like a terminal does.
         let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
@@ -4267,6 +4302,10 @@ impl App {
     /// project, in a dialog that defaults to Cancel.
     fn delete_current(self: &Rc<Self>) {
         let Some(target) = self.selected_row() else { return };
+        self.confirm_delete(target);
+    }
+
+    fn confirm_delete(self: &Rc<Self>, target: Row) {
         let (message, detail, button) = {
             let state = self.state.borrow();
             match &target {
@@ -4406,15 +4445,17 @@ impl App {
 
     fn open_rename(self: &Rc<Self>) {
         match self.selected_row() {
-            Some(Row::Session(sid)) => {
-                let title = self.state.borrow().session(&sid).map(|(_, s)| s.title.clone()).unwrap_or_default();
-                self.picker.fill("rename task", Some(("task name", &title)), &[]);
-                *self.picker.mode.borrow_mut() = PickerMode::Rename(sid);
-                self.picker.show();
-            }
+            Some(Row::Session(sid)) => self.open_rename_task(&sid),
             Some(Row::Project(pid)) => self.open_rename_project(&pid),
             _ => self.flash("select a task or a project to rename it"),
         }
+    }
+
+    fn open_rename_task(self: &Rc<Self>, sid: &str) {
+        let title = self.state.borrow().session(sid).map(|(_, s)| s.title.clone()).unwrap_or_default();
+        self.picker.fill("rename task", Some(("task name", &title)), &[]);
+        *self.picker.mode.borrow_mut() = PickerMode::Rename(sid.to_string());
+        self.picker.show();
     }
 
     fn open_rename_project(self: &Rc<Self>, pid: &str) {
@@ -4735,5 +4776,312 @@ mod tests {
         assert_eq!(project_folder_name("../../etc"), "etc");
         assert_eq!(project_folder_name("  a/b\\c "), "abc");
         assert_eq!(project_folder_name("..."), "");
+    }
+}
+
+/// A right-click menu entry: its label and what it does. `None` in a list
+/// of these draws a separator.
+type MenuItem = (String, Rc<dyn Fn(&Rc<App>)>);
+
+fn item(label: impl Into<String>, run: impl Fn(&Rc<App>) + 'static) -> Option<MenuItem> {
+    Some((label.into(), Rc::new(run)))
+}
+
+/// Calls `f` with the widget and the point clicked on a right-click.
+fn on_right_click<W: IsA<gtk::Widget>>(widget: &W, f: impl Fn(&gtk::Widget, f64, f64) + 'static) {
+    let g = gtk::GestureClick::new();
+    g.set_button(3);
+    g.connect_pressed(move |g, _, x, y| {
+        if let Some(w) = g.widget() {
+            f(&w, x, y);
+        }
+    });
+    widget.add_controller(g);
+}
+
+// ── right-click menus ──────────────────────────────────────────────────────
+
+impl App {
+    /// Shows a menu at (x, y) in `on`. A picked entry runs once the menu has
+    /// closed, so it may rebuild the widget the menu hung from.
+    fn popup(self: &Rc<Self>, on: &impl IsA<gtk::Widget>, x: f64, y: f64, items: Vec<Option<MenuItem>>) {
+        let menu = gtk::Popover::new();
+        menu.add_css_class("cb-menu");
+        menu.set_has_arrow(false);
+        menu.set_position(gtk::PositionType::Bottom);
+        menu.set_halign(gtk::Align::Start);
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        for entry in items {
+            let Some((label, run)) = entry else {
+                list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                continue;
+            };
+            let l = gtk::Label::new(Some(&label));
+            l.set_xalign(0.0);
+            let button = gtk::Button::new();
+            button.set_child(Some(&l));
+            button.set_has_frame(false);
+            let (b, m) = (self.clone(), menu.clone());
+            button.connect_clicked(move |_| {
+                m.popdown();
+                let (b, run) = (b.clone(), run.clone());
+                glib::idle_add_local_once(move || run(&b));
+            });
+            list.append(&button);
+        }
+        menu.set_child(Some(&list));
+        menu.set_parent(on);
+        menu.connect_closed(|m| {
+            let m = m.clone();
+            glib::idle_add_local_once(move || {
+                if m.parent().is_some() {
+                    m.unparent();
+                }
+            });
+        });
+        menu.popup();
+    }
+
+    /// Makes a project the one actions apply to, showing its task list.
+    fn focus_project(self: &Rc<Self>, pid: &str) {
+        self.view.set(View::Tasks);
+        self.show_project(pid);
+        self.rebuild_sidebar();
+    }
+
+    /// Makes a task the one actions apply to without opening it, so a
+    /// stopped task is not resumed just to browse its files.
+    fn target_task(&self, sid: &str) {
+        let Some(pid) = self.state.borrow().session(sid).map(|(p, _)| p.id.clone()) else { return };
+        *self.current_project.borrow_mut() = Some(pid);
+        *self.current_key.borrow_mut() = Some(sid.to_string());
+    }
+
+    fn project_menu(self: &Rc<Self>, pid: &str, on: &gtk::Widget, x: f64, y: f64) {
+        let Some(p) = self.state.borrow().project(pid).cloned() else { return };
+        let with = |f: fn(&Rc<App>)| {
+            let pid = p.id.clone();
+            move |b: &Rc<App>| {
+                b.focus_project(&pid);
+                f(b);
+            }
+        };
+        let id = p.id.clone();
+        let mut items = vec![
+            item("new task…", with(|b| b.open_new_task())),
+            item("rename…", move |b| b.open_rename_project(&id)),
+            None,
+            item("notes", with(|b| b.show_view(View::Notes))),
+            item("workflows", with(|b| b.show_view(View::Workflows))),
+            item("artifacts", with(|b| b.show_view(View::Artifacts))),
+            item("processes", with(|b| b.show_view(View::Processes))),
+            None,
+            item("browse files", with(|b| b.open_files())),
+        ];
+        if git::is_repo(&p.path) {
+            items.push(item("git", with(|b| b.open_git_here())));
+        }
+        items.extend([
+            item("open the folder", {
+                let path = p.path.clone();
+                move |_| {
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                }
+            }),
+            item("copy the folder path", {
+                let path = p.path.display().to_string();
+                move |b| b.copy_text(&path)
+            }),
+            None,
+            item(if p.browser { "take the agents' browser away" } else { "give the agents a browser" }, with(|b| b.toggle_browser())),
+            item("import past chats…", with(|b| b.open_import())),
+            item("link notes to a folder…", with(|b| b.link_notes_dialog(false))),
+            None,
+        ]);
+        let id = p.id.clone();
+        items.push(item("remove project…", move |b| b.confirm_delete(Row::Project(id.clone()))));
+        self.popup(on, x, y, items);
+    }
+
+    fn task_menu(self: &Rc<Self>, sid: &str, on: &gtk::Widget, x: f64, y: f64) {
+        let Some((project, session)) = self.state.borrow().session(sid).map(|(p, s)| (p.clone(), s.clone())) else { return };
+        let running = self.status_of(sid).running();
+        let pinned = self.pinned.borrow().clone();
+        let id = || sid.to_string();
+        let mut items = vec![
+            item(if running { "open" } else { "open (resumes it)" }, { let id = id(); move |b| b.show_session(&id) }),
+            item("rename…", { let id = id(); move |b| b.open_rename_task(&id) }),
+        ];
+        if running {
+            items.push(item("stop", {
+                let id = id();
+                move |b| {
+                    b.stop(&id);
+                    b.flash("stopped. select it again to resume");
+                }
+            }));
+            if pinned.as_deref() != Some(sid) && pinned.is_none() {
+                items.push(item("pin on the right", {
+                    let id = id();
+                    move |b| {
+                        b.show_session(&id);
+                        b.toggle_split();
+                    }
+                }));
+            }
+            if agents::supports_handoff(&session.agent) {
+                items.push(item("hand off to a fresh session", {
+                    let id = id();
+                    move |b| {
+                        b.show_session(&id);
+                        b.start_handoff();
+                    }
+                }));
+            }
+        }
+        if pinned.is_some() {
+            items.push(item("close the split", |b| b.toggle_split()));
+        }
+        items.push(None);
+        items.push(item("browse files", { let id = id(); move |b| { b.target_task(&id); b.open_files(); } }));
+        let dir = session.dir(&project);
+        if git::is_repo(&dir) {
+            items.push(item("git", { let id = id(); move |b| { b.target_task(&id); b.open_git_here(); } }));
+        }
+        items.push(item("copy the folder path", {
+            let path = dir.display().to_string();
+            move |b| b.copy_text(&path)
+        }));
+        if let Some(w) = &session.worktree {
+            let into = git::branch(&project.path).unwrap_or_else(|| "?".into());
+            let question = format!("Merge {} into {into}?", w.branch);
+            items.push(item("merge into its branch…", {
+                let id = id();
+                move |b| b.confirm_merge(&id, &question)
+            }));
+        }
+        items.push(None);
+        items.push(item("delete task…", { let id = id(); move |b| b.confirm_delete(Row::Session(id.clone())) }));
+        self.popup(on, x, y, items);
+    }
+
+    /// Asks before merging a worktree task, then merges it as a second
+    /// Ctrl+Shift+M would.
+    fn confirm_merge(self: &Rc<Self>, sid: &str, question: &str) {
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(question)
+            .detail("The task's work is committed, then merged.")
+            .buttons(["Cancel", "Merge"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let (b, sid) = (self.clone(), sid.to_string());
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            if res == Ok(1) {
+                b.target_task(&sid);
+                *b.pending_merge.borrow_mut() = Some((sid.clone(), Instant::now()));
+                b.merge_current();
+            }
+        });
+    }
+
+    fn sidebar_menu(self: &Rc<Self>, on: &gtk::Widget, x: f64, y: f64) {
+        let archived = self.show_archived.get();
+        self.popup(
+            on,
+            x,
+            y,
+            vec![
+                item("new task…", |b| b.open_new_task()),
+                item("filter tasks", |b| b.open_search()),
+                item(if archived { "hide handed-off tasks" } else { "show handed-off tasks" }, |b| b.run_action(Action::Archived)),
+                None,
+                item("hide the sidebar", |b| b.run_action(Action::Sidebar)),
+            ],
+        );
+    }
+
+    fn page_menu(self: &Rc<Self>, index: usize, on: &gtk::Widget, x: f64, y: f64) {
+        let (act, alt) = match self.page_items.borrow().get(index) {
+            Some(i) => (i.act.clone(), i.alt.clone()),
+            None => return,
+        };
+        let mut items = Vec::new();
+        for a in act.iter().chain(alt.iter()) {
+            let run = a.clone();
+            items.push(item(page_act_label(a), move |b| b.run_page_act(run.clone())));
+            match a.clone() {
+                PageAct::Edit(path) => {
+                    let text = path.display().to_string();
+                    items.push(item("copy the path", move |b| b.copy_text(&text)));
+                }
+                PageAct::OpenUrl(url) => items.push(item("copy the address", move |b| b.copy_text(&url))),
+                _ => {}
+            }
+        }
+        if !matches!(act, Some(PageAct::Refresh)) {
+            if !items.is_empty() {
+                items.push(None);
+            }
+            items.push(item("refresh", |b| b.run_page_act(PageAct::Refresh)));
+        }
+        self.popup(on, x, y, items);
+    }
+
+    fn terminal_menu(self: &Rc<Self>, key: &str, term: &vte::Terminal, x: f64, y: f64) {
+        term.grab_focus();
+        let t = term.clone();
+        let mut items = Vec::new();
+        if term.has_selection() {
+            items.push(item("copy", move |_| t.copy_clipboard_format(vte::Format::Text)));
+        }
+        let t = term.clone();
+        items.push(item("paste", move |_| t.paste_clipboard()));
+        let t = term.clone();
+        items.push(item("select all", move |_| t.select_all()));
+        let session = self.state.borrow().session(key).map(|(_, s)| s.clone());
+        if let Some(s) = session {
+            let pinned = self.pinned.borrow().clone();
+            items.push(None);
+            items.push(item("rename task…", { let id = key.to_string(); move |b| b.open_rename_task(&id) }));
+            if pinned.is_none() {
+                items.push(item("pin on the right", { let id = key.to_string(); move |b| { b.show_session(&id); b.toggle_split(); } }));
+            } else {
+                items.push(item("close the split", |b| b.toggle_split()));
+            }
+            if agents::supports_handoff(&s.agent) {
+                items.push(item("hand off to a fresh session", { let id = key.to_string(); move |b| { b.show_session(&id); b.start_handoff(); } }));
+            }
+            items.push(item("stop", {
+                let id = key.to_string();
+                move |b| {
+                    b.stop(&id);
+                    b.flash("stopped. select it again to resume");
+                }
+            }));
+        }
+        self.popup(term, x, y, items);
+    }
+
+    fn copy_text(self: &Rc<Self>, text: &str) {
+        self.window.clipboard().set_text(text);
+        self.flash("copied");
+    }
+}
+
+fn page_act_label(act: &PageAct) -> &'static str {
+    match act {
+        PageAct::OpenArtifact(..) => "open",
+        PageAct::Edit(_) => "edit",
+        PageAct::NewNote => "new note…",
+        PageAct::RunWorkflow(_) => "run",
+        PageAct::NewWorkflow => "new workflow…",
+        PageAct::OpenUrl(_) => "open in the browser",
+        PageAct::StopProcess(_) => "stop the process",
+        PageAct::Obsidian => "open in Obsidian",
+        PageAct::LinkNotes => "link to a folder…",
+        PageAct::Refresh => "refresh",
     }
 }
