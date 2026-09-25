@@ -148,6 +148,7 @@ const ACTIONS: &[(&str, &str, Action)] = &[
 /// Keys with no action of their own, listed after the actions.
 const OTHER_KEYS: &[(&str, &str)] = &[
     ("Tab", "in the new task box: give the task its own git worktree"),
+    ("Shift+Enter", "in the new task box: tick agents to blast one prompt to all of them"),
     ("Ctrl+1 … 9", "switch to project tab 1 to 9 (Ctrl+PgUp / PgDn: previous / next)"),
     ("Alt+1 … 7", "views: tasks, files, notes, workflows, artifacts, git, processes"),
     ("Ctrl+Shift+← / →", "focus the left or right side of a split"),
@@ -247,6 +248,24 @@ fn project_folder_name(typed: &str) -> String {
         .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .collect();
     name.trim_matches(['.', '-']).to_string()
+}
+
+/// A short task name from the start of a blast prompt.
+fn blast_name(prompt: &str) -> String {
+    let mut name = String::new();
+    for word in prompt.split_whitespace().take(6) {
+        if name.chars().count() + word.chars().count() > 40 {
+            break;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
+    if name.is_empty() {
+        name = prompt.chars().take(40).collect();
+    }
+    name
 }
 
 /// A fresh worktree and branch for a task, under Codebench's data folder.
@@ -410,6 +429,8 @@ struct Picker {
     workflows: RefCell<Vec<Option<Workflow>>>,
     /// NewTask mode: give the task its own worktree (None if not a repo).
     isolate: Cell<Option<bool>>,
+    /// NewTask mode: agents ticked for a blast task, in the order ticked.
+    picked: RefCell<Vec<&'static str>>,
     /// Import mode rows.
     past: RefCell<Vec<Past>>,
     /// AddProject mode rows.
@@ -1251,6 +1272,13 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
+                && mods.contains(gdk::ModifierType::SHIFT_MASK)
+                && matches!(*b.picker.mode.borrow(), PickerMode::NewTask)
+            {
+                b.toggle_blast_agent();
+                return glib::Propagation::Stop;
             }
             if key == gdk::Key::Tab && matches!(*b.picker.mode.borrow(), PickerMode::NewTask) {
                 if let Some(on) = b.picker.isolate.get() {
@@ -4416,13 +4444,11 @@ impl App {
             .project(&pid)
             .map_or((false, false), |p| (git::is_repo(&p.path), git::has_commit(&p.path)));
         let agents = agents::installed();
-        self.picker.fill(
-            "",
-            Some(("task name (optional)", "")),
-            &agents.iter().map(|a| format!("{:<9}{}", a.id, a.label)).collect::<Vec<_>>(),
-        );
+        self.picker.fill("", Some(("task name (optional)", "")), &[]);
         self.picker.isolate.set((is_repo && has_commit).then_some(false));
         *self.picker.items.borrow_mut() = agents.iter().map(|a| a.id).collect();
+        self.picker.picked.borrow_mut().clear();
+        self.fill_new_task_agents();
         *self.picker.mode.borrow_mut() = PickerMode::NewTask;
         self.new_task_title();
         if is_repo && !has_commit {
@@ -4440,7 +4466,134 @@ impl App {
             Some(false) => "   tab: own worktree [off]",
             None => "",
         };
-        self.picker.title.set_text(&format!("new task in {name}{isolate}"));
+        let picked = self.picker.picked.borrow();
+        if picked.is_empty() {
+            self.picker.title.set_text(&format!("new task in {name}{isolate}   ⇧enter: blast"));
+        } else {
+            let each = if self.picker.isolate.get() == Some(true) { " (one worktree each)" } else { "" };
+            self.picker.title.set_text(&format!("blast in {name} → {}{isolate}{each}", picked.join(", ")));
+        }
+    }
+
+    /// The agent rows of the new task box, with a tick on blast agents.
+    fn fill_new_task_agents(&self) {
+        let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0);
+        let picked = self.picker.picked.borrow().clone();
+        let rows: Vec<String> = self
+            .picker
+            .items
+            .borrow()
+            .iter()
+            .filter_map(|id| agents::get(id))
+            .map(|a| {
+                let tick = if picked.is_empty() {
+                    ""
+                } else if picked.contains(&a.id) {
+                    "[x] "
+                } else {
+                    "[ ] "
+                };
+                format!("{tick}{:<9}{}", a.id, a.label)
+            })
+            .collect();
+        self.picker.set_options(&rows);
+        if let Some(row) = self.picker.list.row_at_index(idx) {
+            self.picker.list.select_row(Some(&row));
+        }
+    }
+
+    /// Ticks or unticks the highlighted agent for a blast task: one prompt
+    /// started on every ticked agent at once.
+    fn toggle_blast_agent(self: &Rc<Self>) {
+        let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
+        let Some(agent) = self.picker.items.borrow().get(idx).copied() else { return };
+        if !agents::takes_opening_prompt(agent) {
+            self.flash("a shell can't take a prompt, so it can't join a blast");
+            return;
+        }
+        let was_empty = {
+            let mut picked = self.picker.picked.borrow_mut();
+            let was_empty = picked.is_empty();
+            match picked.iter().position(|a| *a == agent) {
+                Some(i) => {
+                    picked.remove(i);
+                }
+                None => picked.push(agent),
+            }
+            was_empty
+        };
+        let now_empty = self.picker.picked.borrow().is_empty();
+        if was_empty && !now_empty {
+            // Agents editing one folder at once trip over each other, so a
+            // blast starts with a worktree each; Tab still turns it off.
+            if self.picker.isolate.get().is_some() {
+                self.picker.isolate.set(Some(true));
+            }
+            self.picker.entry.set_placeholder_text(Some("prompt for every ticked agent"));
+        } else if now_empty {
+            self.picker.entry.set_placeholder_text(Some("task name (optional)"));
+        }
+        self.fill_new_task_agents();
+        self.new_task_title();
+    }
+
+    /// Starts one task per ticked agent, all with the same prompt.
+    fn start_blast(self: &Rc<Self>, prompt: String) {
+        let picked = std::mem::take(&mut *self.picker.picked.borrow_mut());
+        if prompt.is_empty() {
+            *self.picker.picked.borrow_mut() = picked;
+            *self.picker.mode.borrow_mut() = PickerMode::NewTask;
+            self.flash("type the prompt to send to every ticked agent");
+            return;
+        }
+        let Some(pid) = self.current_project.borrow().clone() else { return };
+        let Some(project) = self.state.borrow().project(&pid).cloned() else { return };
+        let name = blast_name(&prompt);
+        let isolate = self.picker.isolate.get() == Some(true);
+        self.picker.root.set_visible(false);
+        let mut first = None;
+        let mut failed = Vec::new();
+        for agent in picked {
+            let id = uuid::Uuid::new_v4().to_string();
+            let title = format!("{name} · {agent}");
+            let worktree = if isolate {
+                match make_worktree(&project, &id, &title) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        failed.push(format!("{agent}: {e}"));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            {
+                let mut state = self.state.borrow_mut();
+                let Some(p) = state.project_mut(&pid) else { return };
+                p.sessions.push(Session {
+                    id: id.clone(),
+                    agent: agent.to_string(),
+                    title,
+                    created: store::now(),
+                    launched: false,
+                    prompt: Some(prompt.clone()),
+                    archived: false,
+                    workflow: None,
+                    worktree,
+                    codex_id: None,
+                });
+                state.save();
+            }
+            self.launch(&id, None);
+            first.get_or_insert(id);
+        }
+        self.rebuild_sidebar();
+        if let Some(id) = first {
+            self.select(&Row::Session(id));
+        }
+        if !failed.is_empty() {
+            self.flash(&format!("could not create a worktree for {}", failed.join("; ")));
+        }
     }
 
     fn open_rename(self: &Rc<Self>) {
@@ -4627,6 +4780,7 @@ impl App {
                 }
                 self.close_picker();
             }
+            PickerMode::NewTask if !self.picker.picked.borrow().is_empty() => self.start_blast(text),
             PickerMode::NewTask => {
                 let idx = self.picker.list.selected_row().map(|r| r.index()).unwrap_or(0) as usize;
                 let agent = self.picker.items.borrow().get(idx).copied().unwrap_or("claude");
@@ -4716,6 +4870,7 @@ impl Picker {
             items: RefCell::default(),
             workflows: RefCell::default(),
             isolate: Cell::new(None),
+            picked: RefCell::new(Vec::new()),
             past: RefCell::default(),
             add_choices: RefCell::default(),
             actions: RefCell::default(),
@@ -4769,6 +4924,13 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blast_names_come_from_the_prompt() {
+        assert_eq!(blast_name("give me five ideas for a landing page hero section"), "give me five ideas for a");
+        assert_eq!(blast_name("  fix   it "), "fix it");
+        assert_eq!(blast_name(&"x".repeat(60)), "x".repeat(40));
+    }
 
     #[test]
     fn project_names_become_safe_folders() {
