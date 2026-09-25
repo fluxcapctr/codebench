@@ -177,6 +177,10 @@ paned > separator {{ background: {muted}; min-width: 1px; }}
 .cb-root > separator, .cb-root > separator:hover, .cb-root > separator:focus, .cb-root > separator:backdrop {{ background: {muted}; min-width: 1px; box-shadow: none; outline: none; }}
 paned > separator:focus, paned > separator:hover {{ background: {muted}; box-shadow: none; outline: none; }}
 .cb-tabs {{ background: {dark}; border-bottom: 1px solid {muted}; padding: 0 4px; }}
+.cb-subs-toggle {{ padding: 4px 10px; min-height: 0; background: transparent; opacity: 0.7; }}
+.cb-subs-toggle:hover {{ opacity: 1; background: alpha({light}, 0.6); }}
+.cb-fade {{ transition: opacity 250ms ease; }}
+.cb-fade.cb-faded {{ opacity: 0; }}
 .cb-tab {{ padding: 8px 14px; min-height: 0; color: {muted}; background: transparent; border-bottom: 2px solid transparent; }}
 .cb-tab:hover {{ color: {fg}; background: alpha({light}, 0.6); }}
 .cb-tab.active {{ color: {fg}; background: {bg}; border-bottom-color: {accent}; }}

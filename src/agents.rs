@@ -153,12 +153,14 @@ fn real_program(program: &str) -> Option<String> {
 
 /// Builds the argv for a session. Resumes the previous conversation when there
 /// is one; otherwise starts fresh. The opening prompt is `extra` if given,
-/// else the session's own (fresh starts only).
-pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<String> {
+/// else the session's own (fresh starts only). The flag says whether the argv
+/// carries a prompt, so the agent starts working without any typing.
+pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> (Vec<String>, bool) {
     let s = |v: &str| v.to_string();
     let context = notes::agent_context(project);
     let (mcp_cmd, mcp_args, mcp_env) = mcp_server(session);
-    match session.agent.as_str() {
+    let mut prompted = false;
+    let argv = match session.agent.as_str() {
         "claude" => {
             let mut argv = vec![s("claude")];
             let resume = claude_transcript(&session.id).is_some();
@@ -189,6 +191,7 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
                 context,
             ]);
             let prompt = extra.or(if resume { None } else { session.prompt.as_deref() });
+            prompted = prompt.is_some();
             if let Some(prompt) = prompt {
                 // `--add-dir` and `--mcp-config` take several values, so end
                 // options first.
@@ -231,7 +234,11 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
             // the flag and exits. It can still read the notes folder.
             match codex_session(session) {
                 Some(id) => argv.extend([s("resume"), id]),
-                None => argv.extend(extra.or(session.prompt.as_deref()).map(str::to_string)),
+                None => {
+                    let prompt = extra.or(session.prompt.as_deref());
+                    prompted = prompt.is_some();
+                    argv.extend(prompt.map(str::to_string));
+                }
             }
             argv
         }
@@ -241,6 +248,7 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
             let prompt = extra.or(if session.launched { None } else { session.prompt.as_deref() });
             let config = opencode_config(session, project, &context, session.agent == "local");
             let mut argv = vec![s("env"), format!("OPENCODE_CONFIG_CONTENT={config}"), s("opencode")];
+            prompted = prompt.is_some();
             if let Some(prompt) = prompt {
                 argv.extend([s("--prompt"), prompt.to_string()]);
             }
@@ -249,12 +257,14 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
         "cursor" => {
             let prompt = extra.or(if session.launched { None } else { session.prompt.as_deref() });
             let mut argv = vec![s("cursor-agent"), s("--add-dir"), project.notes_dir().to_string_lossy().into_owned()];
+            prompted = prompt.is_some();
             argv.extend(prompt.map(str::to_string));
             argv
         }
         "gemini" | "grok" | "agy" => {
             let prompt = extra.or(if session.launched { None } else { session.prompt.as_deref() });
             let mut argv = vec![get(&session.agent).map_or("", |a| a.program).to_string()];
+            prompted = prompt.is_some();
             match (session.agent.as_str(), prompt) {
                 (_, None) => {}
                 ("grok", Some(p)) => argv.extend([s("--"), p.to_string()]),
@@ -265,7 +275,8 @@ pub fn argv(session: &Session, project: &Project, extra: Option<&str>) -> Vec<St
         }
         "shell" => vec![shell()],
         other => vec![get(other).map(|a| a.program).unwrap_or(other).to_string()],
-    }
+    };
+    (argv, prompted)
 }
 
 /// OpenCode config layered on the user's own through
@@ -498,13 +509,16 @@ mod tests {
         };
         let count = |argv: &[String], text: &str| argv.iter().filter(|v| v.contains(text)).count();
         for (agent, program) in [("gemini", "gemini"), ("grok", "grok"), ("agy", "agy")] {
-            let argv = argv(&session(agent, false), &project, None);
+            let (argv, prompted) = argv(&session(agent, false), &project, None);
+            assert!(prompted);
             assert_eq!(argv[0], program);
             assert_eq!(count(&argv, "UNIQUE_OPENING_PROMPT"), 1, "{argv:?}");
             let expected = if agent == "grok" { "-UNIQUE_OPENING_PROMPT" } else { "--prompt-interactive=-UNIQUE_OPENING_PROMPT" };
             assert_eq!(argv.last().unwrap(), expected);
-            assert_eq!(super::argv(&session(agent, true), &project, None), vec![program.to_string()]);
-            assert_eq!(count(&super::argv(&session(agent, true), &project, Some("LATER")), "LATER"), 1);
+            assert_eq!(super::argv(&session(agent, true), &project, None), (vec![program.to_string()], false));
+            let (later, prompted) = super::argv(&session(agent, true), &project, Some("LATER"));
+            assert!(prompted);
+            assert_eq!(count(&later, "LATER"), 1);
             assert!(takes_opening_prompt(agent) && takes_prompt_on_resume(agent));
         }
         assert!(!takes_opening_prompt("shell") && !takes_opening_prompt("nope"));

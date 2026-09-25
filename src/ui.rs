@@ -281,13 +281,16 @@ fn make_worktree(project: &store::Project, id: &str, title: &str) -> Result<stor
 #[derive(Serialize, Deserialize, Clone)]
 struct UiSettings {
     sidebar_width: i32,
+    /// The agents' logins and limits are tucked away behind their icon.
+    #[serde(default)]
+    limits_hidden: bool,
 }
 
 fn ui_settings() -> UiSettings {
     std::fs::read(store::config_dir().join("ui.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(UiSettings { sidebar_width: 270 })
+        .unwrap_or(UiSettings { sidebar_width: 270, limits_hidden: false })
 }
 
 fn save_ui_settings(s: &UiSettings) {
@@ -499,6 +502,8 @@ struct App {
     accounts: RefCell<Vec<Account>>,
     usage: RefCell<Vec<Usage>>,
     agents_label: gtk::Label,
+    /// Claude's icon that shows and hides the logins and limits.
+    agents_icon: gtk::Image,
     paned: gtk::Paned,
     side_box: gtk::Box,
     side_header: gtk::Label,
@@ -530,12 +535,17 @@ struct App {
     editor: gtk::TextView,
     /// The file open in the notes editor.
     editor_path: RefCell<Option<PathBuf>>,
+    /// The project that file belongs to, to reopen it after a failed save.
+    editor_project: RefCell<Option<String>>,
     /// Bumped on every edit; a save runs once typing pauses.
     editor_gen: Cell<u32>,
     /// Set while loading a file, so loading is not taken as an edit.
     editor_loading: Cell<bool>,
     /// Typed into since the last load or save.
     editor_dirty: Cell<bool>,
+    /// The unsaved-edits dialog is up, so leaving again does not stack
+    /// another one.
+    editor_asking: Cell<bool>,
     /// The file's text as last loaded or saved, to notice outside edits.
     editor_disk: RefCell<Option<String>>,
     /// The task you last looked at in each project, reopened with its tab.
@@ -769,7 +779,7 @@ impl App {
         tabs_scroll.set_hexpand(true);
         tabs_scroll.set_child(Some(&tabs_box));
         let subs = label("cb-dim");
-        subs.set_margin_end(10);
+        subs.set_margin_end(2);
         subs.set_ellipsize(pango::EllipsizeMode::End);
         subs.set_max_width_chars(40);
         subs.set_text(&format!(
@@ -781,8 +791,46 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
+        // The logins and limits slide out to the right of Claude's icon,
+        // and click it again to tuck them away.
+        let subs_reveal = gtk::Revealer::new();
+        subs_reveal.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
+        subs_reveal.set_transition_duration(250);
+        subs_reveal.set_child(Some(&subs));
+        subs.add_css_class("cb-fade");
+        let hidden = ui_settings().limits_hidden;
+        subs_reveal.set_reveal_child(!hidden);
+        if hidden {
+            subs.add_css_class("cb-faded");
+        }
+        let subs_icon = gtk::Image::new();
+        if let Some(icon) = agent_icon("claude", &theme) {
+            subs_icon.set_paintable(Some(&icon));
+        }
+        subs_icon.set_pixel_size(14);
+        let subs_toggle = gtk::Button::new();
+        subs_toggle.set_child(Some(&subs_icon));
+        subs_toggle.set_has_frame(false);
+        subs_toggle.set_focus_on_click(false);
+        subs_toggle.add_css_class("cb-subs-toggle");
+        subs_toggle.set_tooltip_text(Some(if hidden { "show limits" } else { "hide limits" }));
+        {
+            let (subs, reveal) = (subs.clone(), subs_reveal.clone());
+            subs_toggle.connect_clicked(move |btn| {
+                let show = !reveal.reveals_child();
+                reveal.set_reveal_child(show);
+                if show {
+                    subs.remove_css_class("cb-faded");
+                } else {
+                    subs.add_css_class("cb-faded");
+                }
+                btn.set_tooltip_text(Some(if show { "hide limits" } else { "show limits" }));
+                save_ui_settings(&UiSettings { limits_hidden: !show, ..ui_settings() });
+            });
+        }
         tabbar.append(&tabs_scroll);
-        tabbar.append(&subs.clone());
+        tabbar.append(&subs_reveal);
+        tabbar.append(&subs_toggle);
 
         // The current project's views.
         let viewbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -908,7 +956,7 @@ impl App {
         root.connect_position_notify(|paned| {
             let width = paned.position();
             if width >= 160 {
-                save_ui_settings(&UiSettings { sidebar_width: width });
+                save_ui_settings(&UiSettings { sidebar_width: width, ..ui_settings() });
             }
         });
         window.set_child(Some(&shell));
@@ -948,6 +996,7 @@ impl App {
             accounts: RefCell::default(),
             usage: RefCell::new(limits::load()),
             agents_label: subs,
+            agents_icon: subs_icon,
             paned,
             side_box,
             side_header,
@@ -968,9 +1017,11 @@ impl App {
             page_items: RefCell::default(),
             editor,
             editor_path: RefCell::default(),
+            editor_project: RefCell::default(),
             editor_gen: Cell::new(0),
             editor_loading: Cell::new(false),
             editor_dirty: Cell::new(false),
+            editor_asking: Cell::new(false),
             editor_disk: RefCell::default(),
             last_task: RefCell::default(),
             me: RefCell::default(),
@@ -1209,13 +1260,17 @@ impl App {
         // Leaving the editor any way at all saves it and lets go of the file.
         let b = self.clone();
         self.stack.connect_visible_child_name_notify(move |st| {
-            if st.visible_child_name().as_deref() != Some("editor") {
-                b.close_editor();
+            if st.visible_child_name().as_deref() != Some("editor") && !b.close_editor() {
+                b.unsaved_edits(|_| {});
             }
         });
         let b = self.clone();
-        self.window.connect_close_request(move |_| {
-            b.save_editor();
+        self.window.connect_close_request(move |w| {
+            if !b.close_editor() {
+                let w = w.clone();
+                b.unsaved_edits(move |_| w.close());
+                return glib::Propagation::Stop;
+            }
             // Closing stops every task, so nothing is left to stay awake for.
             b.awake.borrow_mut().release();
             glib::Propagation::Proceed
@@ -1362,6 +1417,9 @@ impl App {
             b.reload_pending.set(false);
             *b.theme.borrow_mut() = Theme::load();
             b.css.load_from_string(&b.theme.borrow().css());
+            if let Some(icon) = agent_icon("claude", &b.theme.borrow()) {
+                b.agents_icon.set_paintable(Some(&icon));
+            }
             if let Some(r) = b.remote.borrow().as_ref() {
                 r.publish_theme(phone_css(&b.theme.borrow()));
             }
@@ -2291,7 +2349,7 @@ impl App {
             // `omarchy-launch-editor --inline`), so let the shell split it.
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
             let argv = vec!["sh".to_string(), "-c".to_string(), format!("exec {editor} brief.md")];
-            b.spawn(&key, "editor", &argv, &dir, &[]);
+            b.spawn(&key, "editor", &argv, &dir, &[], false);
         });
     }
 
@@ -2503,7 +2561,9 @@ impl App {
     }
 
     /// Runs `argv` in the terminal for `key`, creating the terminal if needed.
-    fn spawn(self: &Rc<Self>, key: &str, agent: &str, argv: &[String], cwd: &Path, env: &[String]) {
+    /// `prompted` means argv carries an opening prompt, so the agent starts
+    /// out working rather than waiting for you to type.
+    fn spawn(self: &Rc<Self>, key: &str, agent: &str, argv: &[String], cwd: &Path, env: &[String], prompted: bool) {
         let existing = self.running.borrow().get(key).cloned();
         let running = match existing {
             Some(r) => {
@@ -2544,6 +2604,11 @@ impl App {
                 r
             }
         };
+        // Claude's hooks say when it starts on the prompt; the others get
+        // no Enter to mark them working, so the launch does it.
+        let prompted = prompted && agent != "claude";
+        running.armed.set(prompted && watches_activity(agent));
+        running.last_output.set(Instant::now());
 
         let mut env = env.to_vec();
         env.extend(["TERM=xterm-256color".to_string(), "COLORTERM=truecolor".to_string()]);
@@ -2567,13 +2632,16 @@ impl App {
             move |res| match res {
                 Ok(pid) => r.pid.set(Some(pid.0)),
                 Err(e) => {
+                    r.armed.set(false);
                     b.set_status(&id, Status::Exited);
                     b.flash(&format!("could not start {program}: {}", e.message()));
                 }
             },
         );
-        self.status.borrow_mut().insert(key.to_string(), Status::Idle);
+        let status = if prompted { Status::Working } else { Status::Idle };
+        self.status.borrow_mut().insert(key.to_string(), status);
         self.rebuild_sidebar();
+        self.update_keep_awake();
     }
 
     /// Starts the task's agent, resuming its previous conversation if it has
@@ -2597,13 +2665,13 @@ impl App {
             format!("CODEBENCH_PROJECT={}", project.path.display()),
             format!("CODEBENCH_NOTES={}", project.notes_dir().display()),
         ];
-        let argv = agents::argv(&session, &project, prompt);
+        let (argv, prompted) = agents::argv(&session, &project, prompt);
         let dir = session.dir(&project);
         if !dir.is_dir() {
             self.flash(&format!("the task's folder is gone: {}", tilde(&dir)));
             return;
         }
-        self.spawn(sid, &session.agent, &argv, &dir, &env);
+        self.spawn(sid, &session.agent, &argv, &dir, &env, prompted);
 
         if let Some(s) = self.state.borrow_mut().session_mut(sid) {
             s.launched = true;
@@ -2957,7 +3025,7 @@ impl App {
         *self.return_to.borrow_mut() = self.selected_row();
         *self.current_key.borrow_mut() = Some(key.clone());
         let argv = vec!["sh".to_string(), "-c".to_string(), cmd.to_string()];
-        self.spawn(&key, "auth", &argv, &store::home(), &[]);
+        self.spawn(&key, "auth", &argv, &store::home(), &[], false);
         self.focus_terminal(&key);
         self.header_left.set_markup(&format!(
             "<span foreground='{}'><b>{agent}</b></span>  {what}",
@@ -3156,9 +3224,11 @@ impl App {
 
     fn publish_phone_state(&self, state: &State) {
         let Some(remote) = self.remote.borrow().clone() else { return };
+        // Seen on the desktop is not answered: the phone still shows it
+        // as needing you.
         let kind = |sid: &str| match self.status_of(sid) {
-            Status::Waiting | Status::Done => "needs",
-            Status::Working | Status::WaitingSeen => "working",
+            Status::Waiting | Status::WaitingSeen | Status::Done => "needs",
+            Status::Working => "working",
             Status::Idle => "idle",
             Status::Dormant | Status::Exited => "stopped",
         };
@@ -3457,7 +3527,7 @@ impl App {
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
                 vec!["sh".into(), "-c".into(), format!("exec {editor} .")]
             };
-            self.spawn(&key, "editor", &argv, &dir, &[]);
+            self.spawn(&key, "editor", &argv, &dir, &[], false);
         }
         self.focus_terminal(&key);
         self.header_left.set_markup(&format!(
@@ -3478,7 +3548,7 @@ impl App {
             } else {
                 vec!["sh".into(), "-c".into(), "git status; exec \"${SHELL:-sh}\"".into()]
             };
-            self.spawn(&key, "git", &argv, dir, &[]);
+            self.spawn(&key, "git", &argv, dir, &[], false);
         }
         self.focus_terminal(&key);
         self.header_left.set_markup(&format!(
@@ -3513,8 +3583,7 @@ impl App {
         self.rebuild_sidebar();
     }
 
-    /// Commits the worktree task's changes and merges its branch into the
-    /// project. Press twice.
+    /// Merges the selected worktree task. Press twice.
     fn merge_current(self: &Rc<Self>) {
         let Some(Row::Session(sid)) = self.selected_row() else {
             self.flash("select a worktree task to merge");
@@ -3540,7 +3609,18 @@ impl App {
             return;
         }
         *self.pending_merge.borrow_mut() = None;
-        if self.status_of(&sid) == Status::Working {
+        self.merge_task(&sid);
+    }
+
+    /// Commits the worktree task's changes and merges its branch into the
+    /// project. Leaves the selection alone unless there are conflicts to
+    /// resolve.
+    fn merge_task(self: &Rc<Self>, sid: &str) {
+        let Some((project, session)) = self.state.borrow().session(sid).map(|(p, s)| (p.clone(), s.clone())) else {
+            return;
+        };
+        let Some(w) = session.worktree.clone() else { return };
+        if self.status_of(sid) == Status::Working {
             self.flash("the agent is still working. merge when it is done");
             return;
         }
@@ -3554,7 +3634,7 @@ impl App {
             Ok(git::Merge::Merged) => self.flash("merged. ^⇧D removes the task and its worktree when you are done with it"),
             Ok(git::Merge::UpToDate) => self.flash("nothing new to merge"),
             Ok(git::Merge::Conflicts) => {
-                *self.return_to.borrow_mut() = Some(Row::Session(sid));
+                *self.return_to.borrow_mut() = self.selected_row();
                 self.open_git(&project.path);
                 self.flash("merge conflicts: resolve them here in lazygit, or ask an agent in the project to fix them");
             }
@@ -3663,12 +3743,22 @@ impl App {
     /// Opens a note or workflow in the built-in editor: type, it saves as
     /// you go, Esc goes back.
     fn edit_file(self: &Rc<Self>, project: &store::Project, path: &Path) {
-        self.close_editor();
+        if !self.close_editor() {
+            let (project, path) = (project.clone(), path.to_path_buf());
+            self.unsaved_edits(move |b| b.edit_file(&project, &path));
+            return;
+        }
         *self.return_to.borrow_mut() = self.selected_row();
+        *self.editor_path.borrow_mut() = Some(path.to_path_buf());
+        *self.editor_project.borrow_mut() = Some(project.id.clone());
+        self.load_editor(path);
+        self.show_editor(project, path);
+    }
+
+    /// Puts the editor on screen with whatever it holds.
+    fn show_editor(&self, project: &store::Project, path: &Path) {
         *self.current_project.borrow_mut() = Some(project.id.clone());
         *self.current_key.borrow_mut() = Some(format!("note:{}", path.display()));
-        *self.editor_path.borrow_mut() = Some(path.to_path_buf());
-        self.load_editor(path);
         self.stack.set_visible_child_name("editor");
         self.editor.grab_focus();
         self.header_left.set_markup(&format!(
@@ -3693,13 +3783,80 @@ impl App {
     }
 
     /// Saves pending edits and lets go of the file, so later navigation
-    /// never writes it again.
-    fn close_editor(self: &Rc<Self>) {
+    /// never writes it again. If the save fails the edits go to a recovery
+    /// copy; if that fails too, returns false and keeps the file open with
+    /// its edits.
+    fn close_editor(self: &Rc<Self>) -> bool {
         self.save_editor();
-        if !self.editor_dirty.get() {
-            *self.editor_path.borrow_mut() = None;
-            *self.editor_disk.borrow_mut() = None;
+        if self.editor_dirty.get() && !self.recover_editor() {
+            return false;
         }
+        self.release_editor();
+        true
+    }
+
+    fn release_editor(&self) {
+        self.editor_dirty.set(false);
+        *self.editor_path.borrow_mut() = None;
+        *self.editor_project.borrow_mut() = None;
+        *self.editor_disk.borrow_mut() = None;
+    }
+
+    /// Writes unsaved edits to Codebench's own data folder, for when the
+    /// file itself cannot be written.
+    fn recover_editor(self: &Rc<Self>) -> bool {
+        let Some(path) = self.editor_path.borrow().clone() else { return true };
+        let buffer = self.editor.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let dir = store::data_dir().join("recovered");
+        let copy = dir.join(format!("{stem} {}{ext}", store::now()));
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&copy, &text)) {
+            Ok(()) => {
+                self.flash(&format!(
+                    "could not save {}; your edits are in {}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    tilde(&copy)
+                ));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The editor holds edits that could not be saved anywhere. Asks
+    /// whether to go back to them or throw them away and carry on.
+    fn unsaved_edits(self: &Rc<Self>, then: impl FnOnce(&Rc<App>) + 'static) {
+        let Some(path) = self.editor_path.borrow().clone() else { return };
+        // One click can switch pages more than once; ask only once.
+        if self.editor_asking.replace(true) {
+            return;
+        }
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(format!("Your edits to {} are not saved", path.file_name().unwrap_or_default().to_string_lossy()))
+            .detail(format!(
+                "Neither {} nor a recovery copy could be written. Go back to copy the text somewhere safe, or discard it.",
+                tilde(&path)
+            ))
+            .buttons(["Go back", "Discard"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let b = self.clone();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            b.editor_asking.set(false);
+            if res == Ok(1) {
+                b.release_editor();
+                then(&b);
+                return;
+            }
+            let project = b.editor_project.borrow().clone().and_then(|pid| b.state.borrow().project(&pid).cloned());
+            if let Some(project) = project {
+                b.show_editor(&project, &path);
+            }
+        });
     }
 
     /// Writes what was typed to the file. Untouched files are never
@@ -3798,7 +3955,7 @@ impl App {
             let file = path.to_string_lossy().replace('\'', "'\\''");
             let argv = vec!["sh".to_string(), "-c".to_string(), format!("exec {editor} '{file}'")];
             let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| project.path.clone());
-            self.spawn(&key, "editor", &argv, &dir, &[]);
+            self.spawn(&key, "editor", &argv, &dir, &[], false);
         }
         self.focus_terminal(&key);
         self.header_left.set_markup(&format!(
@@ -3967,17 +4124,24 @@ impl App {
 
         let in_editor = self.current_key.borrow().as_deref().is_some_and(|k| k.starts_with("note:"));
         if in_editor && key == gdk::Key::Escape && !ctrl && !alt && !shift {
-            self.close_editor();
             // Back to the list it was opened from.
-            match self.view.get() {
-                v @ (View::Notes | View::Workflows) => self.show_view(v),
-                _ => self.go_back(),
+            let back = |b: &Rc<App>| match b.view.get() {
+                v @ (View::Notes | View::Workflows) => b.show_view(v),
+                _ => b.go_back(),
+            };
+            if self.close_editor() {
+                back(self);
+            } else {
+                self.unsaved_edits(back);
             }
             return glib::Propagation::Stop;
         }
         if in_editor && ctrl && !shift && !alt && key == gdk::Key::o {
             let path = self.editor_path.borrow().clone();
-            self.close_editor();
+            if !self.close_editor() {
+                self.unsaved_edits(|_| {});
+                return glib::Propagation::Stop;
+            }
             let project = self.current_project.borrow().clone().and_then(|pid| self.state.borrow().project(&pid).cloned());
             if let (Some(path), Some(p)) = (path, project) {
                 self.edit_in_terminal(&p, &path);
@@ -5128,8 +5292,8 @@ impl App {
         self.popup(on, x, y, items);
     }
 
-    /// Asks before merging a worktree task, then merges it as a second
-    /// Ctrl+Shift+M would.
+    /// Asks before merging a worktree task, then merges it without changing
+    /// which task is showing.
     fn confirm_merge(self: &Rc<Self>, sid: &str, question: &str) {
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
@@ -5142,9 +5306,7 @@ impl App {
         let (b, sid) = (self.clone(), sid.to_string());
         dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |res| {
             if res == Ok(1) {
-                b.target_task(&sid);
-                *b.pending_merge.borrow_mut() = Some((sid.clone(), Instant::now()));
-                b.merge_current();
+                b.merge_task(&sid);
             }
         });
     }
